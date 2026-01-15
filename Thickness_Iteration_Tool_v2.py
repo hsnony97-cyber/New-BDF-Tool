@@ -113,7 +113,7 @@ class ThicknessIterationTool:
             ("Main BDF:", self.input_bdf_path, self.load_bdf, "bdf_status"),
             ("Property Excel:", self.property_excel_path, self.load_properties, "prop_status"),
             ("Allowable Excel:", self.allowable_excel_path, self.rf_load_allowable, "allow_status"),
-            ("Element IDs Excel:", self.element_excel_path, self.load_element_ids, "elem_status"),
+            ("Offset Element IDs:", self.element_excel_path, self.load_element_ids, "elem_status"),
         ]:
             row = ttk.Frame(f1)
             row.pack(fill=tk.X, pady=2)
@@ -578,15 +578,19 @@ class ThicknessIterationTool:
                         filtered_data = elem_data[elem_data['Element_Type'] == critical_elem_type].copy()
 
                         fit_data = []
-                        for t in sorted(filtered_data['Thickness'].unique()):
+                        thickness_vals = pd.Series(filtered_data['Thickness'].values).dropna().unique()
+                        for t in sorted(thickness_vals):
                             t_data = filtered_data[filtered_data['Thickness'] == t]
-                            fit_data.append({'Thickness': float(t), 'Allowable': float(t_data['Allowable'].min())})
+                            if len(t_data) > 0:
+                                fit_data.append({'Thickness': float(t), 'Allowable': float(t_data['Allowable'].min())})
                         fit_df = pd.DataFrame(fit_data)
                     else:
                         fit_data = []
-                        for t in sorted(elem_data['Thickness'].unique()):
+                        thickness_vals = pd.Series(elem_data['Thickness'].values).dropna().unique()
+                        for t in sorted(thickness_vals):
                             t_data = elem_data[elem_data['Thickness'] == t]
-                            fit_data.append({'Thickness': float(t), 'Allowable': float(t_data['Allowable'].min())})
+                            if len(t_data) > 0:
+                                fit_data.append({'Thickness': float(t), 'Allowable': float(t_data['Allowable'].min())})
                         fit_df = pd.DataFrame(fit_data)
 
                     n_pts = len(fit_df)
@@ -640,7 +644,13 @@ class ThicknessIterationTool:
         self.log("  Processing Element_Type format...")
 
         result_data = []
-        properties = df['Property'].unique()
+
+        # Get unique properties safely
+        if 'Property' not in df.columns:
+            self.log("  WARNING: No 'Property' column found")
+            return pd.DataFrame(result_data)
+
+        properties = pd.Series(df['Property'].values).dropna().unique()
 
         for pid in properties:
             prop_df = df[df['Property'] == pid].copy()
@@ -665,10 +675,17 @@ class ThicknessIterationTool:
             else:
                 filtered_df = prop_df.copy()
 
-            for t in sorted(filtered_df['Thickness'].unique()):
+            # Get unique thicknesses safely (avoid DataFrame.unique() issue)
+            if 'Thickness' not in filtered_df.columns or len(filtered_df) == 0:
+                continue
+
+            thickness_values = pd.Series(filtered_df['Thickness'].values).dropna().unique()
+
+            for t in sorted(thickness_values):
                 t_data = filtered_df[filtered_df['Thickness'] == t]
-                min_allow = t_data['Allowable'].min()
-                result_data.append({'Property': int(pid), 'Thickness': float(t), 'Allowable': float(min_allow)})
+                if len(t_data) > 0:
+                    min_allow = t_data['Allowable'].min()
+                    result_data.append({'Property': int(pid), 'Thickness': float(t), 'Allowable': float(min_allow)})
 
         self.log(f"  Processed: {len(properties)} properties -> {len(result_data)} data points")
         return pd.DataFrame(result_data)
