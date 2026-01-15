@@ -6,14 +6,13 @@ Automated thickness optimization for BDF models with property-level control.
 
 Features:
 - Reads main BDF file
-- Individual property thickness optimization
+- Individual property/element thickness optimization
 - Automatic offset calculation and application
 - Runs Nastran analysis
-- Calculates RF using allowable data with power law fitting
+- Calculates RF using allowable data with power law fitting (Element & Property based)
 - Sensitivity-based optimization for minimum weight
 - Detailed iteration logging per folder
-
-Author: Generated for structural analysis workflow
+- Density read from BDF MAT1 cards
 """
 
 import tkinter as tk
@@ -60,33 +59,37 @@ class ThicknessIterationToolV2:
         self.r2_threshold = tk.StringVar(value="0.95")
         self.min_data_points = tk.StringVar(value="3")
 
-        # Material/Weight settings
-        self.density = tk.StringVar(value="2.7e-9")  # tonnes/mm³
-
         # Optimization settings
         self.max_iterations = tk.StringVar(value="50")
-        self.convergence_threshold = tk.StringVar(value="0.01")  # 1% weight change
 
         # Internal storage
         self.bdf_model = None
 
         # Property data
-        self.bar_properties = {}  # PID -> {dim1, dim2, type, thickness}
+        self.bar_properties = {}  # PID -> {dim1, dim2, type, material}
         self.skin_properties = {}  # PID -> {thickness, material}
+
+        # Material densities from BDF
+        self.material_densities = {}  # MID -> density
 
         # Current thickness state (PID -> current_thickness)
         self.current_bar_thicknesses = {}
         self.current_skin_thicknesses = {}
 
-        # Allowable fits
+        # Allowable fits - Property based
         self.bar_allowable_interp = {}  # PID -> {a, b, r2, excluded}
         self.skin_allowable_interp = {}  # PID -> {a, b, r2, excluded}
+
+        # Allowable fits - Element based (like Tab 4)
+        self.bar_allowable_elem_interp = {}  # EID -> {a, b, r2, excluded, property}
+        self.skin_allowable_elem_interp = {}  # EID -> {a, b, r2, excluded, property}
 
         # Geometry data
         self.element_areas = {}  # EID -> area (shells)
         self.bar_lengths = {}  # EID -> length (bars)
         self.prop_elements = {}  # PID -> [EID list]
         self.elem_to_prop = {}  # EID -> PID
+        self.prop_to_material = {}  # PID -> MID
 
         # Element lists for offsets
         self.landing_elem_ids = []
@@ -126,7 +129,7 @@ class ThicknessIterationToolV2:
         # Title
         ttk.Label(main, text="Thickness Iteration Tool v2.0",
                   font=('Helvetica', 16, 'bold')).pack(pady=(10, 5))
-        ttk.Label(main, text="Property-level thickness optimization with RF targeting and minimum weight objective",
+        ttk.Label(main, text="Property/Element-level thickness optimization with RF targeting (like RF Check v2.1)",
                   font=('Helvetica', 10), foreground='gray').pack(pady=(0, 10))
 
         # === Section 1: Input Files ===
@@ -277,15 +280,7 @@ class ThicknessIterationToolV2:
         row.pack(fill=tk.X, pady=5)
         ttk.Label(row, text="Max Iterations:", width=15).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.max_iterations, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row, text="Convergence:", width=15).pack(side=tk.LEFT, padx=10)
-        ttk.Entry(row, textvariable=self.convergence_threshold, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row, text="(weight change threshold)", foreground='gray').pack(side=tk.LEFT, padx=5)
-
-        row = ttk.Frame(frame)
-        row.pack(fill=tk.X, pady=5)
-        ttk.Label(row, text="Density (t/mm³):", width=15).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.density, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row, text="(2.7e-9 for aluminum, 7.85e-9 for steel)", foreground='gray').pack(side=tk.LEFT, padx=10)
+        ttk.Label(row, text="(Density is read from BDF MAT1 cards automatically)", foreground='gray').pack(side=tk.LEFT, padx=10)
 
     def _create_action_section(self, parent):
         """Create action buttons section"""
@@ -340,30 +335,22 @@ class ThicknessIterationToolV2:
     def _log_instructions(self):
         """Log initial instructions"""
         self.log("="*80)
-        self.log("Thickness Iteration Tool v2.0 - Advanced Property-Level Optimization")
+        self.log("Thickness Iteration Tool v2.0 - Element/Property Based Optimization")
         self.log("="*80)
         self.log("\nWorkflow:")
-        self.log("1. Load BDF file (contains shell and bar elements)")
-        self.log("2. Load Property Excel (Bar_Properties, Skin_Properties, Residual_Strength sheets)")
-        self.log("3. Load Allowable Excel (Bar_Allowable, Skin_Allowable sheets with T vs Allowable)")
+        self.log("1. Load BDF file (reads elements, properties, and material densities)")
+        self.log("2. Load Property Excel (Bar_Properties, Skin_Properties sheets)")
+        self.log("3. Load Allowable Excel (with columns: Bar Element ID, Bar Property, d, Allowable)")
         self.log("4. Load Element IDs Excel (Landing_Offset, Bar_Offset sheets) - optional for offset")
         self.log("5. Set thickness ranges and RF target")
         self.log("6. Click 'START ITERATION'")
-        self.log("\nAlgorithm:")
-        self.log("- Starts with minimum thicknesses for all properties")
-        self.log("- For each iteration:")
-        self.log("  1. Updates PBARL/PSHELL cards in BDF")
-        self.log("  2. Calculates offsets (landing zoffset = -t/2, bar wa/wb)")
-        self.log("  3. Runs Nastran analysis")
-        self.log("  4. Extracts stress results from OP2")
-        self.log("  5. Calculates RF for each element using power law: Allowable = a * T^b")
-        self.log("  6. Identifies failing elements (RF < target)")
-        self.log("  7. Increases thickness for properties with failures")
-        self.log("  8. Uses sensitivity to adjust thickness increments")
-        self.log("- Continues until all RF >= target with minimum weight")
+        self.log("\nAllowable Fitting (like RF Check v2.1):")
+        self.log("- Property-based: Fits Allowable = a × T^b per Property ID")
+        self.log("- Element-based: Fits Allowable = a × T^b per Element ID")
+        self.log("- Uses element fit first, falls back to property fit")
         self.log("\nWeight Calculation:")
-        self.log("  Skin: Sum(element_area) * thickness * density")
-        self.log("  Bar:  Sum(bar_length) * dim1 * dim2 * density")
+        self.log("  Skin: Sum(element_area) × thickness × density (from MAT1)")
+        self.log("  Bar:  Sum(bar_length) × dim1 × dim2 × density (from MAT1)")
         self.log("="*80 + "\n")
 
     # ========== UTILITY FUNCTIONS ==========
@@ -392,7 +379,7 @@ class ThicknessIterationToolV2:
 
     # ========== LOADING FUNCTIONS ==========
     def load_bdf(self):
-        """Load BDF and extract geometry"""
+        """Load BDF and extract geometry + material densities"""
         path = self.input_bdf_path.get()
         if not path or not os.path.exists(path):
             messagebox.showerror("Error", "Select a valid BDF file")
@@ -410,19 +397,36 @@ class ThicknessIterationToolV2:
             n_nodes = len(self.bdf_model.nodes)
             n_elements = len(self.bdf_model.elements)
             n_properties = len(self.bdf_model.properties)
+            n_materials = len(self.bdf_model.materials)
 
             self.log(f"  Nodes: {n_nodes}")
             self.log(f"  Elements: {n_elements}")
             self.log(f"  Properties: {n_properties}")
+            self.log(f"  Materials: {n_materials}")
+
+            # Extract material densities
+            self.material_densities = {}
+            for mid, mat in self.bdf_model.materials.items():
+                if hasattr(mat, 'rho') and mat.rho:
+                    self.material_densities[mid] = mat.rho
+                    self.log(f"    MAT1 {mid}: density = {mat.rho}")
 
             # Reset storage
             self.element_areas = {}
             self.bar_lengths = {}
             self.prop_elements = {}
             self.elem_to_prop = {}
+            self.prop_to_material = {}
 
             shell_count = 0
             bar_count = 0
+
+            # Extract property -> material mapping
+            for pid, prop in self.bdf_model.properties.items():
+                if hasattr(prop, 'mid') and prop.mid:
+                    self.prop_to_material[pid] = prop.mid
+                elif hasattr(prop, 'mid_ref') and prop.mid_ref:
+                    self.prop_to_material[pid] = prop.mid_ref.mid
 
             for eid, elem in self.bdf_model.elements.items():
                 pid = elem.pid if hasattr(elem, 'pid') else None
@@ -453,7 +457,7 @@ class ThicknessIterationToolV2:
             self.log(f"  Total bar length: {sum(self.bar_lengths.values()):.2f} mm")
 
             self.bdf_status.config(
-                text=f"✓ {n_elements} elements, {n_properties} properties",
+                text=f"✓ {n_elements} elements, {n_properties} properties, {n_materials} materials",
                 foreground="green"
             )
 
@@ -515,7 +519,6 @@ class ThicknessIterationToolV2:
                             'dim2': dim2,
                             'type': bar_type
                         }
-                        # Initialize current thickness to minimum
                         self.current_bar_thicknesses[pid] = bar_min
 
                 self.log(f"  Loaded {len(self.bar_properties)} bar properties")
@@ -554,7 +557,7 @@ class ThicknessIterationToolV2:
             self.prop_status.config(text=f"Error", foreground="red")
 
     def load_allowable(self):
-        """Load allowable data and fit power law curves"""
+        """Load allowable data and fit power law curves - Element & Property based like RF Check v2.1"""
         path = self.allowable_excel_path.get()
         if not path or not os.path.exists(path):
             messagebox.showerror("Error", "Select Allowable file")
@@ -562,6 +565,7 @@ class ThicknessIterationToolV2:
 
         self.log("\n" + "="*70)
         self.log("LOADING ALLOWABLE DATA & FITTING POWER LAW")
+        self.log("(Element & Property based - like RF Check v2.1)")
         self.log("="*70)
 
         try:
@@ -571,10 +575,14 @@ class ThicknessIterationToolV2:
             r2_thresh = 0.95
             min_pts = 3
 
+        self.log(f"R² Threshold: {r2_thresh}, Min Data Points: {min_pts}")
+
         try:
             if path.endswith('.csv'):
                 df = pd.read_csv(path)
-                self._fit_power_law(df, 'bar', r2_thresh, min_pts)
+                self.log(f"\nLoaded CSV: {len(df)} rows")
+                self.log(f"Columns: {list(df.columns)}")
+                self._process_allowable_data(df, 'bar', r2_thresh, min_pts)
             else:
                 xl = pd.ExcelFile(path)
                 sheets = xl.sheet_names
@@ -582,20 +590,23 @@ class ThicknessIterationToolV2:
 
                 for s in sheets:
                     sl = s.lower().replace('_', '').replace(' ', '')
-                    if 'bar' in sl and 'allow' in sl:
-                        self.log(f"\nFitting '{s}' (Bar)...")
-                        df = pd.read_excel(xl, sheet_name=s)
-                        self._fit_power_law(df, 'bar', r2_thresh, min_pts)
-                    elif 'skin' in sl and 'allow' in sl:
-                        self.log(f"\nFitting '{s}' (Skin)...")
-                        df = pd.read_excel(xl, sheet_name=s)
-                        self._fit_power_law(df, 'skin', r2_thresh, min_pts)
+                    df = pd.read_excel(xl, sheet_name=s)
+                    self.log(f"\nProcessing '{s}'...")
+                    self.log(f"  Columns: {list(df.columns)}")
+                    self.log(f"  Rows: {len(df)}")
 
-            n_bar = len(self.bar_allowable_interp)
-            n_skin = len(self.skin_allowable_interp)
+                    if 'bar' in sl or 'allow' in sl or 'summary' in sl:
+                        self._process_allowable_data(df, 'bar', r2_thresh, min_pts)
+                    elif 'skin' in sl:
+                        self._process_allowable_data(df, 'skin', r2_thresh, min_pts)
+
+            n_bar_prop = len(self.bar_allowable_interp)
+            n_bar_elem = len(self.bar_allowable_elem_interp)
+            n_skin_prop = len(self.skin_allowable_interp)
+            n_skin_elem = len(self.skin_allowable_elem_interp)
 
             self.allow_status.config(
-                text=f"✓ Bar: {n_bar} fits, Skin: {n_skin} fits",
+                text=f"✓ Bar: {n_bar_prop} props, {n_bar_elem} elems | Skin: {n_skin_prop} props, {n_skin_elem} elems",
                 foreground="green"
             )
 
@@ -605,84 +616,215 @@ class ThicknessIterationToolV2:
             self.log(traceback.format_exc())
             self.allow_status.config(text="Error", foreground="red")
 
-    def _fit_power_law(self, df, prop_type, r2_thresh, min_pts):
-        """Fit power law Allowable = a * T^b for each property"""
-        # Standardize column names
-        col_map = {}
-        for col in df.columns:
-            cu = col.upper().replace(' ', '_').strip('_')
-            if cu in ['PROPERTY_ID', 'PROPERTY', 'PROP_ID', 'PID']:
-                col_map[col] = 'Property'
-            elif cu in ['T', 'THICKNESS', 'T_MM', 'DIM1', 'DIM']:
-                col_map[col] = 'Thickness'
-            elif cu in ['ALLOWABLE', 'ALLOW', 'ALLOWABLE_STRESS', 'ALLOW_MPA']:
-                col_map[col] = 'Allowable'
+    def _process_allowable_data(self, df, prop_type, r2_thresh, min_pts):
+        """Process allowable data with flexible column mapping - Element & Property based"""
+        self.log(f"\n  --- Processing {prop_type.upper()} allowable data ---")
 
+        # === STEP 1: Map columns flexibly ===
+        col_map = {}
+        original_cols = list(df.columns)
+
+        for col in df.columns:
+            col_clean = str(col).strip()
+            col_upper = col_clean.upper().replace(' ', '_').replace('-', '_')
+
+            # Element ID mapping
+            if any(x in col_upper for x in ['ELEMENT_ID', 'ELEMENT ID', 'BAR_ELEMENT_ID', 'ELEM_ID', 'EID']):
+                col_map[col] = 'Element_ID'
+            # Property ID mapping
+            elif any(x in col_upper for x in ['PROPERTY_ID', 'PROPERTY', 'BAR_PROPERTY', 'PROP_ID', 'PID', 'BAR_PROP']):
+                col_map[col] = 'Property'
+            # Thickness mapping (d, t, thickness, dim)
+            elif col_upper in ['D', 'T', 'THICKNESS', 'DIM', 'DIM1', 'T_MM'] or col_upper.strip() == 'D':
+                col_map[col] = 'Thickness'
+            # Allowable mapping
+            elif any(x in col_upper for x in ['ALLOWABLE', 'ALLOW', 'ALLOWABLE_STRESS']):
+                col_map[col] = 'Allowable'
+            # R Value / RF
+            elif any(x in col_upper for x in ['R_VALUE', 'R VALUE', 'RF', 'RVALUE']):
+                col_map[col] = 'R_Value'
+
+        self.log(f"  Column mapping:")
+        for orig, mapped in col_map.items():
+            self.log(f"    '{orig}' -> '{mapped}'")
+
+        # Apply mapping
         df = df.rename(columns=col_map)
 
-        # Clean data
+        # Check required columns
+        required_property = 'Property' in df.columns
+        required_thickness = 'Thickness' in df.columns
+        required_allowable = 'Allowable' in df.columns
+        has_element_id = 'Element_ID' in df.columns
+
+        if not required_property:
+            self.log(f"  WARNING: 'Property' column not found!")
+            self.log(f"  Available columns: {list(df.columns)}")
+            return
+
+        if not required_thickness:
+            self.log(f"  WARNING: 'Thickness' column not found!")
+            return
+
+        if not required_allowable:
+            self.log(f"  WARNING: 'Allowable' column not found!")
+            return
+
+        self.log(f"  Has Element_ID column: {has_element_id}")
+
+        # === STEP 2: Clean and convert data ===
         df['Property'] = pd.to_numeric(df['Property'], errors='coerce')
         df['Thickness'] = pd.to_numeric(df['Thickness'], errors='coerce')
         df['Allowable'] = pd.to_numeric(df['Allowable'], errors='coerce')
+
+        if has_element_id:
+            df['Element_ID'] = pd.to_numeric(df['Element_ID'], errors='coerce')
+
+        # Remove invalid rows
         df = df.dropna(subset=['Property', 'Thickness', 'Allowable'])
+        self.log(f"  Valid rows after cleaning: {len(df)}")
 
-        interp = self.bar_allowable_interp if prop_type == 'bar' else self.skin_allowable_interp
-        valid_count = 0
-        excluded_count = 0
+        if len(df) == 0:
+            self.log("  WARNING: No valid data after cleaning!")
+            return
 
-        for pid in df['Property'].unique():
+        # === STEP 3: Property-based fitting ===
+        self.log(f"\n  --- PROPERTY-BASED FITTING ---")
+        prop_interp = self.bar_allowable_interp if prop_type == 'bar' else self.skin_allowable_interp
+
+        properties = df['Property'].unique()
+        self.log(f"  Unique properties: {len(properties)}")
+
+        valid_prop_count = 0
+        excluded_prop_count = 0
+
+        for pid in properties:
             pid_int = int(pid)
             pdata = df[df['Property'] == pid]
-            n = len(pdata)
+
+            # For property-based: take minimum allowable per thickness
+            fit_data = []
+            for t in sorted(pdata['Thickness'].unique()):
+                t_data = pdata[pdata['Thickness'] == t]
+                min_allow = t_data['Allowable'].min()
+                fit_data.append({'Thickness': float(t), 'Allowable': float(min_allow)})
+
+            fit_df = pd.DataFrame(fit_data)
+            n = len(fit_df)
 
             if n < min_pts:
-                interp[pid_int] = {'a': pdata['Allowable'].mean(), 'b': 0, 'r2': 0, 'n': n, 'excluded': True}
-                excluded_count += 1
+                avg = fit_df['Allowable'].mean() if len(fit_df) > 0 else 0
+                prop_interp[pid_int] = {'a': avg, 'b': 0, 'r2': 0, 'n': n, 'excluded': True}
+                excluded_prop_count += 1
                 continue
 
-            x = pdata['Thickness'].values.astype(float)
-            y = pdata['Allowable'].values.astype(float)
+            result = self._fit_single_power_law(fit_df['Thickness'].values, fit_df['Allowable'].values, r2_thresh)
+            result['n'] = n
+            prop_interp[pid_int] = result
 
-            mask = (x > 0) & (y > 0)
-            x, y = x[mask], y[mask]
+            if result['excluded']:
+                excluded_prop_count += 1
+            else:
+                valid_prop_count += 1
 
-            if len(x) < 2:
-                interp[pid_int] = {'a': np.mean(y), 'b': 0, 'r2': 0, 'n': len(x), 'excluded': True}
-                excluded_count += 1
-                continue
+        self.log(f"  Property fits: {valid_prop_count} valid, {excluded_prop_count} excluded")
 
-            try:
-                # Log-linear fit
-                log_x, log_y = np.log(x), np.log(y)
-                coeffs = np.polyfit(log_x, log_y, 1)
-                b, log_a = coeffs[0], coeffs[1]
-                a = np.exp(log_a)
-
-                # R²
-                y_pred = a * (x ** b)
-                ss_res = np.sum((y - y_pred) ** 2)
-                ss_tot = np.sum((y - np.mean(y)) ** 2)
-                r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-
-                if r2 < r2_thresh:
-                    interp[pid_int] = {'a': np.mean(y), 'b': 0, 'r2': r2, 'n': n, 'excluded': True}
-                    excluded_count += 1
-                else:
-                    interp[pid_int] = {'a': a, 'b': b, 'r2': r2, 'n': n, 'excluded': False}
-                    valid_count += 1
-
-            except:
-                interp[pid_int] = {'a': np.mean(y), 'b': 0, 'r2': 0, 'n': n, 'excluded': True}
-                excluded_count += 1
-
-        self.log(f"  Valid fits: {valid_count}, Excluded: {excluded_count}")
-
-        # Show sample fits
-        self.log(f"  Sample fits:")
-        for pid in list(interp.keys())[:5]:
-            p = interp[pid]
+        # Show sample property fits
+        sample_count = 0
+        for pid in list(prop_interp.keys())[:5]:
+            p = prop_interp[pid]
             if not p['excluded']:
                 self.log(f"    PID {pid}: Allowable = {p['a']:.4f} × T^({p['b']:.4f}), R²={p['r2']:.4f}")
+                sample_count += 1
+        if sample_count == 0:
+            for pid in list(prop_interp.keys())[:3]:
+                p = prop_interp[pid]
+                self.log(f"    PID {pid}: Allowable = {p['a']:.4f} (constant, excluded)")
+
+        # === STEP 4: Element-based fitting (if Element_ID exists) ===
+        if has_element_id:
+            self.log(f"\n  --- ELEMENT-BASED FITTING ---")
+            elem_interp = self.bar_allowable_elem_interp if prop_type == 'bar' else self.skin_allowable_elem_interp
+
+            elements = df['Element_ID'].dropna().unique()
+            self.log(f"  Unique elements: {len(elements)}")
+
+            valid_elem_count = 0
+            excluded_elem_count = 0
+
+            for eid in elements:
+                eid_int = int(eid)
+                edata = df[df['Element_ID'] == eid]
+
+                # Get property for this element
+                elem_pid = edata['Property'].iloc[0] if len(edata) > 0 else None
+                elem_pid_int = int(elem_pid) if pd.notna(elem_pid) else None
+
+                # For element-based: take minimum allowable per thickness
+                fit_data = []
+                for t in sorted(edata['Thickness'].unique()):
+                    t_data = edata[edata['Thickness'] == t]
+                    min_allow = t_data['Allowable'].min()
+                    fit_data.append({'Thickness': float(t), 'Allowable': float(min_allow)})
+
+                fit_df = pd.DataFrame(fit_data)
+                n = len(fit_df)
+
+                if n < min_pts:
+                    avg = fit_df['Allowable'].mean() if len(fit_df) > 0 else 0
+                    elem_interp[eid_int] = {'a': avg, 'b': 0, 'r2': 0, 'n': n, 'excluded': True, 'property': elem_pid_int}
+                    excluded_elem_count += 1
+                    continue
+
+                result = self._fit_single_power_law(fit_df['Thickness'].values, fit_df['Allowable'].values, r2_thresh)
+                result['n'] = n
+                result['property'] = elem_pid_int
+                elem_interp[eid_int] = result
+
+                if result['excluded']:
+                    excluded_elem_count += 1
+                else:
+                    valid_elem_count += 1
+
+            self.log(f"  Element fits: {valid_elem_count} valid, {excluded_elem_count} excluded")
+
+            # Show sample element fits
+            sample_count = 0
+            for eid in list(elem_interp.keys())[:5]:
+                e = elem_interp[eid]
+                if not e['excluded']:
+                    self.log(f"    EID {eid}: Allowable = {e['a']:.4f} × T^({e['b']:.4f}), R²={e['r2']:.4f}")
+                    sample_count += 1
+
+    def _fit_single_power_law(self, x, y, r2_thresh):
+        """Fit single power law curve"""
+        x = np.array(x).astype(float)
+        y = np.array(y).astype(float)
+
+        mask = (x > 0) & (y > 0)
+        x, y = x[mask], y[mask]
+
+        if len(x) < 2:
+            return {'a': np.mean(y) if len(y) > 0 else 0, 'b': 0, 'r2': 0, 'excluded': True}
+
+        try:
+            log_x, log_y = np.log(x), np.log(y)
+            coeffs = np.polyfit(log_x, log_y, 1)
+            b, log_a = coeffs[0], coeffs[1]
+            a = np.exp(log_a)
+
+            y_pred = a * (x ** b)
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+            if r2 < r2_thresh:
+                return {'a': np.mean(y), 'b': 0, 'r2': r2, 'excluded': True}
+            else:
+                return {'a': a, 'b': b, 'r2': r2, 'excluded': False}
+
+        except:
+            return {'a': np.mean(y), 'b': 0, 'r2': 0, 'excluded': True}
 
     def load_element_ids(self):
         """Load element IDs for offset calculation"""
@@ -723,10 +865,87 @@ class ThicknessIterationToolV2:
             self.log(f"\nERROR: {e}")
             self.elem_status.config(text="Error", foreground="red")
 
+    # ========== HELPER FUNCTIONS ==========
+    def get_allowable_stress(self, pid, thickness):
+        """Get allowable stress for property at thickness using power law."""
+        pid_int = int(pid) if not isinstance(pid, int) else pid
+
+        if pid_int not in self.bar_allowable_interp:
+            if pid_int not in self.skin_allowable_interp:
+                return None
+            params = self.skin_allowable_interp[pid_int]
+        else:
+            params = self.bar_allowable_interp[pid_int]
+
+        if params.get('excluded', False) and params['b'] == 0:
+            return params['a']
+
+        return params['a'] * (thickness ** params['b'])
+
+    def get_allowable_stress_elem(self, elem_id, thickness):
+        """Get allowable stress for element at thickness using element's own power law fit."""
+        elem_int = int(elem_id) if not isinstance(elem_id, int) else elem_id
+
+        if elem_int in self.bar_allowable_elem_interp:
+            params = self.bar_allowable_elem_interp[elem_int]
+        elif elem_int in self.skin_allowable_elem_interp:
+            params = self.skin_allowable_elem_interp[elem_int]
+        else:
+            return None
+
+        if params.get('excluded', False) and params['b'] == 0:
+            return params['a']
+
+        return params['a'] * (thickness ** params['b'])
+
+    def get_required_thickness(self, pid, target_stress, min_rf_target=1.0):
+        """Calculate required thickness to achieve target RF."""
+        pid_int = int(pid) if not isinstance(pid, int) else pid
+
+        if pid_int in self.bar_allowable_interp:
+            params = self.bar_allowable_interp[pid_int]
+        elif pid_int in self.skin_allowable_interp:
+            params = self.skin_allowable_interp[pid_int]
+        else:
+            return None
+
+        a = params['a']
+        b = params['b']
+
+        if params.get('excluded', False) or b == 0:
+            return None
+
+        required_allowable = abs(target_stress) * min_rf_target
+
+        if a <= 0:
+            return None
+
+        try:
+            ratio = required_allowable / a
+            if ratio <= 0:
+                return None
+
+            if b != 0:
+                t_required = ratio ** (1.0 / b)
+                if t_required > 0 and t_required < 1000:
+                    return t_required
+            return None
+        except:
+            return None
+
+    def get_density_for_property(self, pid):
+        """Get material density for a property from BDF"""
+        if pid in self.prop_to_material:
+            mid = self.prop_to_material[pid]
+            if mid in self.material_densities:
+                return self.material_densities[mid]
+
+        # Default aluminum density if not found
+        return 2.7e-9
+
     # ========== ITERATION CORE ==========
     def start_iteration(self):
         """Start optimization iteration"""
-        # Validate
         if not self.bdf_model:
             messagebox.showerror("Error", "Load BDF first")
             return
@@ -767,18 +986,15 @@ class ThicknessIterationToolV2:
             bar_min = float(self.bar_min_thickness.get())
             skin_min = float(self.skin_min_thickness.get())
 
-            # Initialize thicknesses
             for pid in self.bar_properties:
                 self.current_bar_thicknesses[pid] = bar_min
             for pid in self.skin_properties:
                 self.current_skin_thicknesses[pid] = skin_min
 
-            # Create test folder
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             test_folder = os.path.join(self.output_folder.get(), f"test_{timestamp}")
             os.makedirs(test_folder, exist_ok=True)
 
-            # Run single iteration
             result = self._run_single_iteration(test_folder, 0)
 
             if result:
@@ -800,7 +1016,6 @@ class ThicknessIterationToolV2:
             self.log("STARTING OPTIMIZATION")
             self.log("="*70)
 
-            # Get parameters
             bar_min = float(self.bar_min_thickness.get())
             bar_max = float(self.bar_max_thickness.get())
             skin_min = float(self.skin_min_thickness.get())
@@ -809,8 +1024,6 @@ class ThicknessIterationToolV2:
             target_rf = float(self.target_rf.get())
             rf_tol = float(self.rf_tolerance.get())
             max_iter = int(self.max_iterations.get())
-            conv_thresh = float(self.convergence_threshold.get())
-            density = float(self.density.get())
 
             self.log(f"\nParameters:")
             self.log(f"  Bar range: {bar_min} - {bar_max} mm")
@@ -818,23 +1031,19 @@ class ThicknessIterationToolV2:
             self.log(f"  Target RF: {target_rf} ± {rf_tol}")
             self.log(f"  Max iterations: {max_iter}")
 
-            # Create base folder
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_folder = os.path.join(self.output_folder.get(), f"optimization_{timestamp}")
             os.makedirs(base_folder, exist_ok=True)
 
-            # Initialize all thicknesses to minimum
             for pid in self.bar_properties:
                 self.current_bar_thicknesses[pid] = bar_min
             for pid in self.skin_properties:
                 self.current_skin_thicknesses[pid] = skin_min
 
             iteration = 0
-            converged = False
-            prev_weight = 0
             best_weight = float('inf')
 
-            while iteration < max_iter and self.is_running and not converged:
+            while iteration < max_iter and self.is_running:
                 iteration += 1
 
                 self.log(f"\n{'='*60}")
@@ -844,16 +1053,13 @@ class ThicknessIterationToolV2:
                 progress = (iteration / max_iter) * 100
                 self.update_progress(progress, f"Iteration {iteration}/{max_iter}")
 
-                # Create iteration folder
                 iter_folder = os.path.join(base_folder, f"iter_{iteration:03d}")
                 os.makedirs(iter_folder, exist_ok=True)
 
-                # Run this iteration
                 result = self._run_single_iteration(iter_folder, iteration)
 
                 if not result:
-                    self.log("  Iteration failed, trying again with increased thickness...")
-                    # Increase all thicknesses
+                    self.log("  Iteration failed, increasing all thicknesses...")
                     for pid in self.current_bar_thicknesses:
                         self.current_bar_thicknesses[pid] = min(
                             self.current_bar_thicknesses[pid] + step, bar_max)
@@ -864,26 +1070,14 @@ class ThicknessIterationToolV2:
 
                 self.iteration_results.append(result)
 
-                # Check for best solution
                 if result['min_rf'] >= target_rf - rf_tol and result['weight'] < best_weight:
                     best_weight = result['weight']
                     self.best_solution = result.copy()
                     self.log(f"\n  *** NEW BEST: Weight = {best_weight:.6f} t, RF = {result['min_rf']:.4f} ***")
 
-                # Check convergence
-                weight_change = abs(result['weight'] - prev_weight) / max(prev_weight, 1e-10)
-                if result['n_fail'] == 0 and weight_change < conv_thresh:
-                    self.log(f"\n  *** CONVERGED (weight change {weight_change*100:.2f}% < {conv_thresh*100:.2f}%) ***")
-                    converged = True
-                    break
-
-                prev_weight = result['weight']
-
-                # Update thicknesses based on results
                 if result['n_fail'] > 0:
                     self._update_thicknesses_smart(result, step, bar_min, bar_max, skin_min, skin_max, target_rf)
                 else:
-                    # Try to reduce thickness for over-designed properties
                     self._reduce_overdesigned(result, step, bar_min, skin_min, target_rf, rf_tol)
 
             # Final summary
@@ -897,18 +1091,8 @@ class ThicknessIterationToolV2:
                 self.log(f"  Min RF: {self.best_solution['min_rf']:.4f}")
                 self.log(f"  Folder: {self.best_solution['folder']}")
 
-                # Show thickness summary
-                self.log(f"\nFinal Bar Thicknesses:")
-                for pid in sorted(self.current_bar_thicknesses.keys())[:10]:
-                    self.log(f"  PID {pid}: {self.current_bar_thicknesses[pid]:.2f} mm")
-
-                self.log(f"\nFinal Skin Thicknesses:")
-                for pid in sorted(self.current_skin_thicknesses.keys())[:10]:
-                    self.log(f"  PID {pid}: {self.current_skin_thicknesses[pid]:.2f} mm")
-
                 self.root.after(0, self._update_ui_results)
 
-            # Save all results
             self._save_all_results(base_folder)
 
             self.root.after(0, lambda: messagebox.showinfo("Complete",
@@ -929,49 +1113,39 @@ class ThicknessIterationToolV2:
             ])
 
     def _run_single_iteration(self, iter_folder, iteration):
-        """Run a single iteration: update BDF -> offset -> nastran -> RF"""
+        """Run a single iteration"""
         try:
-            density = float(self.density.get())
             target_rf = float(self.target_rf.get())
 
-            # Step 1: Update BDF
             self.log("  [1] Updating BDF properties...")
             bdf_path = self._write_updated_bdf(iter_folder)
             if not bdf_path:
                 return None
 
-            # Step 2: Calculate and apply offsets
             self.log("  [2] Applying offsets...")
             offset_bdf = self._apply_offsets(bdf_path, iter_folder)
             if not offset_bdf:
                 offset_bdf = bdf_path
 
-            # Step 3: Run Nastran
             self.log("  [3] Running Nastran...")
             if not self._run_nastran(offset_bdf, iter_folder):
                 self.log("    WARNING: Nastran failed")
-                # Try to continue with dummy results for testing
 
-            # Step 4: Extract stresses
             self.log("  [4] Extracting stresses...")
             stresses = self._extract_stresses(iter_folder)
 
-            # Step 5: Calculate RF
-            self.log("  [5] Calculating RF...")
-            rf_results = self._calculate_rf_per_element(stresses, target_rf)
+            self.log("  [5] Calculating RF (Element & Property based)...")
+            rf_results = self._calculate_rf_element_property_based(stresses, target_rf)
 
-            # Step 6: Calculate weight
             self.log("  [6] Calculating weight...")
-            weight = self._calculate_total_weight(density)
+            weight = self._calculate_total_weight()
 
-            # Summary
             min_rf = rf_results['min_rf'] if rf_results else 0
             n_fail = rf_results['n_fail'] if rf_results else 0
             n_total = rf_results['n_total'] if rf_results else 0
 
             self.log(f"\n  Results: Min RF = {min_rf:.4f}, Failures = {n_fail}/{n_total}, Weight = {weight:.6f} t")
 
-            # Save iteration summary
             result = {
                 'iteration': iteration,
                 'min_rf': min_rf,
@@ -982,7 +1156,8 @@ class ThicknessIterationToolV2:
                 'folder': iter_folder,
                 'bar_thicknesses': self.current_bar_thicknesses.copy(),
                 'skin_thicknesses': self.current_skin_thicknesses.copy(),
-                'failing_pids': rf_results.get('failing_pids', set()) if rf_results else set()
+                'failing_pids': rf_results.get('failing_pids', set()) if rf_results else set(),
+                'rf_results': rf_results
             }
 
             self._save_iteration_results(iter_folder, result, rf_results)
@@ -1012,7 +1187,6 @@ class ThicknessIterationToolV2:
             while i < len(lines):
                 line = lines[i]
 
-                # Update PBARL
                 if line.startswith('PBARL'):
                     try:
                         pid = int(line[8:16].strip())
@@ -1020,12 +1194,10 @@ class ThicknessIterationToolV2:
                             t = self.current_bar_thicknesses[pid]
                             new_lines.append(line)
                             i += 1
-                            # Update continuation with dimensions
                             while i < len(lines) and (lines[i].startswith('+') or lines[i].startswith('*') or
                                   (lines[i].startswith(' ') and lines[i].strip())):
                                 cont = lines[i]
                                 if cont.strip() and not cont.strip().startswith('$'):
-                                    # Replace dimensions with current thickness
                                     new_cont = cont[:8] + f"{t:8.4f}" + f"{t:8.4f}"
                                     if len(cont) > 24:
                                         new_cont += cont[24:]
@@ -1040,13 +1212,11 @@ class ThicknessIterationToolV2:
                     except:
                         pass
 
-                # Update PSHELL
                 elif line.startswith('PSHELL'):
                     try:
                         pid = int(line[8:16].strip())
                         if pid in self.current_skin_thicknesses:
                             t = self.current_skin_thicknesses[pid]
-                            # Field 4 (cols 24-32) is thickness
                             new_line = line[:24] + f"{t:8.4f}" + line[32:]
                             new_lines.append(new_line)
                             skin_updated += 1
@@ -1074,11 +1244,9 @@ class ThicknessIterationToolV2:
             return bdf_path
 
         try:
-            # Read BDF for geometry
             bdf = BDF(debug=False)
             bdf.read_bdf(bdf_path, validate=False, xref=True, read_includes=True, encoding='latin-1')
 
-            # Calculate landing normals
             landing_offsets = {}
             landing_normals = {}
 
@@ -1088,7 +1256,6 @@ class ThicknessIterationToolV2:
                 elem = bdf.elements[eid]
                 pid = elem.pid if hasattr(elem, 'pid') else None
 
-                # Get skin thickness for this property
                 if pid and pid in self.current_skin_thicknesses:
                     t = self.current_skin_thicknesses[pid]
                 else:
@@ -1096,7 +1263,6 @@ class ThicknessIterationToolV2:
 
                 landing_offsets[eid] = -t / 2.0
 
-                # Calculate normal
                 if elem.type in ['CQUAD4', 'CTRIA3']:
                     try:
                         nids = elem.node_ids[:3]
@@ -1112,7 +1278,6 @@ class ThicknessIterationToolV2:
                     except:
                         pass
 
-            # Build node -> shell map
             node_to_shells = {}
             for eid, elem in bdf.elements.items():
                 if elem.type in ['CQUAD4', 'CTRIA3']:
@@ -1121,7 +1286,6 @@ class ThicknessIterationToolV2:
                             node_to_shells[nid] = []
                         node_to_shells[nid].append(eid)
 
-            # Calculate bar offsets
             bar_offsets = {}
             for eid in self.bar_offset_elem_ids:
                 if eid not in bdf.elements:
@@ -1140,7 +1304,6 @@ class ThicknessIterationToolV2:
                 if bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
 
-                    # Find thickest landing
                     max_t = 0
                     best_normal = None
                     for shell_eid in common:
@@ -1157,7 +1320,6 @@ class ThicknessIterationToolV2:
                         offset_vec = -best_normal * offset_mag
                         bar_offsets[eid] = tuple(offset_vec)
 
-            # Apply offsets to BDF text
             with open(bdf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
 
@@ -1225,7 +1387,6 @@ class ThicknessIterationToolV2:
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             proc.wait(timeout=600)
 
-            # Check for OP2
             op2_files = [f for f in os.listdir(iter_folder) if f.lower().endswith('.op2')]
             self.log(f"    Nastran complete: {len(op2_files)} OP2 files")
             return len(op2_files) > 0
@@ -1252,7 +1413,6 @@ class ThicknessIterationToolV2:
                     op2 = OP2(debug=False)
                     op2.read_op2(op2_path)
 
-                    # Bar stresses
                     if hasattr(op2, 'cbar_stress') and op2.cbar_stress:
                         for sc_id, data in op2.cbar_stress.items():
                             for i, eid in enumerate(data.element):
@@ -1264,7 +1424,6 @@ class ThicknessIterationToolV2:
                                     'subcase': sc_id
                                 })
 
-                    # Shell stresses
                     if hasattr(op2, 'cquad4_stress') and op2.cquad4_stress:
                         for sc_id, data in op2.cquad4_stress.items():
                             for i, eid in enumerate(data.element):
@@ -1286,40 +1445,51 @@ class ThicknessIterationToolV2:
             self.log(f"    Stress extraction error: {e}")
             return []
 
-    def _calculate_rf_per_element(self, stresses, target_rf):
-        """Calculate RF for each element"""
+    def _calculate_rf_element_property_based(self, stresses, target_rf):
+        """Calculate RF using element fit first, then property fit (like RF Check v2.1)"""
         if not stresses:
             return {'min_rf': 0, 'mean_rf': 0, 'n_fail': 0, 'n_total': 0, 'failing_pids': set(), 'details': []}
 
         rf_list = []
         failing_pids = set()
+        elem_fit_count = 0
+        prop_fit_count = 0
 
         for s in stresses:
             eid = s['eid']
             stress = abs(s['stress'])
             etype = s['type']
 
-            # Get property
             pid = self.elem_to_prop.get(eid)
 
-            # Get allowable
-            allowable = None
+            # Get thickness
             if etype == 'bar' and pid:
-                t = self.current_bar_thicknesses.get(pid, float(self.bar_min_thickness.get()))
-                if pid in self.bar_allowable_interp:
-                    p = self.bar_allowable_interp[pid]
-                    if p['excluded']:
-                        allowable = p['a']
-                    else:
-                        allowable = p['a'] * (t ** p['b'])
-            elif etype == 'shell' and pid:
-                t = self.current_skin_thicknesses.get(pid, float(self.skin_min_thickness.get()))
-                if pid in self.skin_allowable_interp:
-                    p = self.skin_allowable_interp[pid]
-                    if p['excluded']:
-                        allowable = p['a']
-                    else:
-                        allowable = p['a'] * (t ** p['b'])
+                thickness = self.current_bar_thicknesses.get(pid, float(self.bar_min_thickness.get()))
+            else:
+                thickness = self.current_skin_thicknesses.get(pid, float(self.skin_min_thickness.get())) if pid else float(self.skin_min_thickness.get())
+
+            # Try element fit first, then property fit (like RF Check v2.1)
+            allowable = None
+            fit_source = "none"
+
+            # Try element-based fit first
+            if eid in self.bar_allowable_elem_interp:
+                allowable = self.get_allowable_stress_elem(eid, thickness)
+                if allowable is not None:
+                    fit_source = "element"
+                    elem_fit_count += 1
+            elif eid in self.skin_allowable_elem_interp:
+                allowable = self.get_allowable_stress_elem(eid, thickness)
+                if allowable is not None:
+                    fit_source = "element"
+                    elem_fit_count += 1
+
+            # Fall back to property-based fit
+            if allowable is None and pid:
+                allowable = self.get_allowable_stress(pid, thickness)
+                if allowable is not None:
+                    fit_source = "property"
+                    prop_fit_count += 1
 
             # Calculate RF
             if stress == 0:
@@ -1335,21 +1505,30 @@ class ThicknessIterationToolV2:
             if status == 'FAIL' and pid:
                 failing_pids.add(pid)
 
+            # Calculate required thickness
+            required_thickness = None
+            if status == 'FAIL' and pid and stress > 0:
+                required_thickness = self.get_required_thickness(pid, stress, target_rf)
+
             rf_list.append({
                 'eid': eid,
                 'pid': pid,
                 'type': etype,
+                'thickness': thickness,
                 'stress': stress,
                 'allowable': allowable,
                 'rf': rf,
-                'status': status
+                'status': status,
+                'fit_source': fit_source,
+                'required_thickness': required_thickness
             })
 
-        # Statistics
         valid_rf = [r['rf'] for r in rf_list if r['rf'] < 999 and r['rf'] > 0]
         min_rf = min(valid_rf) if valid_rf else 0
         mean_rf = np.mean(valid_rf) if valid_rf else 0
         n_fail = sum(1 for r in rf_list if r['status'] == 'FAIL')
+
+        self.log(f"    Fit sources: {elem_fit_count} element, {prop_fit_count} property")
 
         return {
             'min_rf': min_rf,
@@ -1360,13 +1539,14 @@ class ThicknessIterationToolV2:
             'details': rf_list
         }
 
-    def _calculate_total_weight(self, density):
-        """Calculate total weight"""
+    def _calculate_total_weight(self):
+        """Calculate total weight using density from BDF materials"""
         weight = 0.0
 
         # Shell weight
         for pid in self.skin_properties:
             t = self.current_skin_thicknesses.get(pid, 0)
+            density = self.get_density_for_property(pid)
             if pid in self.prop_elements:
                 area = sum(self.element_areas.get(eid, 0) for eid in self.prop_elements[pid])
                 weight += area * t * density
@@ -1374,32 +1554,48 @@ class ThicknessIterationToolV2:
         # Bar weight
         for pid in self.bar_properties:
             t = self.current_bar_thicknesses.get(pid, 0)
+            density = self.get_density_for_property(pid)
             if pid in self.prop_elements:
                 length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
-                weight += length * t * t * density  # Assuming square section
+                weight += length * t * t * density
 
         return weight
 
     def _update_thicknesses_smart(self, result, step, bar_min, bar_max, skin_min, skin_max, target_rf):
-        """Smart thickness update based on failures"""
+        """Smart thickness update based on failures and required thickness"""
         failing_pids = result.get('failing_pids', set())
+        rf_details = result.get('rf_results', {}).get('details', [])
 
         if not failing_pids:
             return
 
         self.log(f"  Updating {len(failing_pids)} failing properties...")
 
+        # Calculate required thickness from RF results
+        pid_required = {}
+        for r in rf_details:
+            if r['status'] == 'FAIL' and r.get('required_thickness'):
+                pid = r['pid']
+                req_t = r['required_thickness']
+                if pid not in pid_required or req_t > pid_required[pid]:
+                    pid_required[pid] = req_t
+
         for pid in failing_pids:
             if pid in self.current_bar_thicknesses:
                 current = self.current_bar_thicknesses[pid]
-                # Increase by step
-                new_t = min(current + step, bar_max)
-                self.current_bar_thicknesses[pid] = new_t
+                if pid in pid_required:
+                    new_t = min(pid_required[pid] * 1.05, bar_max)  # 5% margin
+                else:
+                    new_t = min(current + step, bar_max)
+                self.current_bar_thicknesses[pid] = max(new_t, current)
 
             if pid in self.current_skin_thicknesses:
                 current = self.current_skin_thicknesses[pid]
-                new_t = min(current + step, skin_max)
-                self.current_skin_thicknesses[pid] = new_t
+                if pid in pid_required:
+                    new_t = min(pid_required[pid] * 1.05, skin_max)
+                else:
+                    new_t = min(current + step, skin_max)
+                self.current_skin_thicknesses[pid] = max(new_t, current)
 
     def _reduce_overdesigned(self, result, step, bar_min, skin_min, target_rf, rf_tol):
         """Try to reduce thickness for over-designed properties"""
@@ -1407,7 +1603,6 @@ class ThicknessIterationToolV2:
         if not rf_details:
             return
 
-        # Find properties with high RF
         pid_rf = {}
         for r in rf_details:
             pid = r.get('pid')
@@ -1416,7 +1611,6 @@ class ThicknessIterationToolV2:
                 if pid not in pid_rf or rf < pid_rf[pid]:
                     pid_rf[pid] = rf
 
-        # Reduce thickness for properties with RF > target + margin
         reduce_threshold = target_rf + rf_tol + 0.2
         reduced = 0
 
@@ -1442,7 +1636,6 @@ class ThicknessIterationToolV2:
     def _save_iteration_results(self, iter_folder, result, rf_results):
         """Save iteration results"""
         try:
-            # Summary CSV
             with open(os.path.join(iter_folder, "summary.csv"), 'w', newline='') as f:
                 w = csv.writer(f)
                 w.writerow(['Parameter', 'Value'])
@@ -1453,12 +1646,10 @@ class ThicknessIterationToolV2:
                 w.writerow(['N_Total', result['n_total']])
                 w.writerow(['Weight_tonnes', result['weight']])
 
-            # RF details
             if rf_results and 'details' in rf_results:
                 pd.DataFrame(rf_results['details']).to_csv(
                     os.path.join(iter_folder, "rf_details.csv"), index=False)
 
-            # Thicknesses
             bar_data = [{'PID': pid, 'Thickness': t} for pid, t in result['bar_thicknesses'].items()]
             skin_data = [{'PID': pid, 'Thickness': t} for pid, t in result['skin_thicknesses'].items()]
 
@@ -1473,7 +1664,6 @@ class ThicknessIterationToolV2:
     def _save_all_results(self, base_folder):
         """Save all optimization results"""
         try:
-            # Iteration history
             history_data = []
             for r in self.iteration_results:
                 history_data.append({
@@ -1485,7 +1675,6 @@ class ThicknessIterationToolV2:
                 })
             pd.DataFrame(history_data).to_csv(os.path.join(base_folder, "iteration_history.csv"), index=False)
 
-            # Best solution
             if self.best_solution:
                 pd.DataFrame([{
                     'iteration': self.best_solution['iteration'],
@@ -1538,7 +1727,6 @@ class ThicknessIterationToolV2:
             path = os.path.join(self.output_folder.get(), f"optimization_results_{timestamp}.xlsx")
 
             with pd.ExcelWriter(path, engine='openpyxl') as writer:
-                # History
                 history = [{
                     'iteration': r['iteration'],
                     'min_rf': r['min_rf'],
@@ -1547,11 +1735,9 @@ class ThicknessIterationToolV2:
                 } for r in self.iteration_results]
                 pd.DataFrame(history).to_excel(writer, sheet_name='History', index=False)
 
-                # Best solution
                 if self.best_solution:
                     pd.DataFrame([self.best_solution]).to_excel(writer, sheet_name='Best', index=False)
 
-                # Final thicknesses
                 bar_data = [{'PID': p, 'Thickness': t} for p, t in self.current_bar_thicknesses.items()]
                 skin_data = [{'PID': p, 'Thickness': t} for p, t in self.current_skin_thicknesses.items()]
 
