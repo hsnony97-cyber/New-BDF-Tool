@@ -442,20 +442,38 @@ class ThicknessIterationTool:
             raw_df = raw_df.rename(columns=clean_cols)
 
             # Map column names (RF Check v2.1 exact mapping)
+            # IMPORTANT: Only map ONE column to Thickness to avoid duplicate columns
             col_map = {}
+            thickness_col_found = None
+
             for col in raw_df.columns:
                 col_up = col.upper().replace(' ', '_').replace('BAR_', '').replace('(MM)', '').strip('_')
 
-                if col_up in ['PROPERTY_ID', 'PROPERTY', 'PROP_ID', 'PROPERTY_ID']:
+                if col_up in ['PROPERTY_ID', 'PROPERTY', 'PROP_ID']:
                     col_map[col] = 'Property'
-                elif col_up in ['ELEMENT_ID', 'ELEMENT', 'ELEMENTID']:
+                elif col_up in ['ELEMENT_ID', 'ELEMENT']:
                     col_map[col] = 'Element_ID'
-                elif col_up in ['ELEMENT_TYPE', 'ELEMENT_TYP', 'ELEMENTTYPE']:
+                elif col_up in ['ELEMENT_TYPE', 'ELEMENT_TYP']:
                     col_map[col] = 'Element_Type'
-                elif col_up in ['T', 'THICKNESS', 'T_MM', 'D']:
-                    col_map[col] = 'Thickness'
                 elif col_up in ['ALLOWABLE', 'ALLOW', 'ALLOWABLE_STRESS']:
                     col_map[col] = 'Allowable'
+
+            # Find thickness column - prioritize 'd' for bar data, then 't'
+            for col in raw_df.columns:
+                col_up = col.upper().replace(' ', '_').replace('BAR_', '').replace('(MM)', '').strip('_')
+                if col_up == 'D' and thickness_col_found is None:
+                    thickness_col_found = col
+                    col_map[col] = 'Thickness'
+                    break
+
+            # If no 'd' column, look for 't' or 'thickness'
+            if thickness_col_found is None:
+                for col in raw_df.columns:
+                    col_up = col.upper().replace(' ', '_').replace('BAR_', '').replace('(MM)', '').strip('_')
+                    if col_up in ['T', 'THICKNESS', 'T_MM'] and thickness_col_found is None:
+                        thickness_col_found = col
+                        col_map[col] = 'Thickness'
+                        break
 
             self.log(f"\nColumn mapping:")
             for orig, mapped in col_map.items():
