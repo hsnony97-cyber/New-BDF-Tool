@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Thickness Iteration Tool v2.1
+Thickness Iteration Tool v3.0
 ==============================
 Per-property thickness optimization with RF Check v2.1 allowable fitting logic.
 
@@ -8,7 +8,10 @@ Features:
 - RF Check v2.1 compatible allowable reading (exact same logic)
 - Per-property individual thickness optimization
 - MAT1/MAT8/MAT9 density support
-- Sensitivity-based smart optimization
+- THREE optimization algorithms:
+  1. Simple Iterative
+  2. Fast GA (Surrogate Model)
+  3. Hybrid GA + Nastran
 - Minimum weight objective with RF constraint
 """
 
@@ -23,13 +26,15 @@ from pyNastran.op2.op2 import OP2
 import numpy as np
 import subprocess
 from datetime import datetime
+import random
+import copy
 
 
 class ThicknessIterationTool:
     def __init__(self, root):
         self.root = root
-        self.root.title("Thickness Iteration Tool v2.1")
-        self.root.geometry("1300x950")
+        self.root.title("Thickness Iteration Tool v3.0")
+        self.root.geometry("1300x1000")
 
         # Input paths
         self.input_bdf_path = tk.StringVar()
@@ -52,8 +57,15 @@ class ThicknessIterationTool:
         self.r2_threshold_var = tk.StringVar(value="0.95")
         self.min_data_points_var = tk.StringVar(value="3")
 
-        # Optimization
+        # Optimization settings
         self.max_iterations = tk.StringVar(value="50")
+        self.algorithm_var = tk.StringVar(value="Simple Iterative")
+
+        # GA Parameters
+        self.ga_population = tk.StringVar(value="50")
+        self.ga_generations = tk.StringVar(value="100")
+        self.ga_mutation_rate = tk.StringVar(value="0.1")
+        self.ga_crossover_rate = tk.StringVar(value="0.8")
 
         # Data storage
         self.bdf_model = None
@@ -78,6 +90,10 @@ class ThicknessIterationTool:
         self.allowable_interp = {}  # PID -> {a, b, r2, excluded, n_pts}
         self.allowable_elem_interp = {}  # EID -> {a, b, r2, excluded, property}
         self.allowable_df = None
+
+        # Reference stresses for surrogate model
+        self.reference_stresses = {}  # PID -> stress at reference thickness
+        self.reference_thickness = {}  # PID -> reference thickness
 
         # Offset elements
         self.landing_elem_ids = []
@@ -179,14 +195,41 @@ class ThicknessIterationTool:
         ttk.Label(row, text="Min Points:").pack(side=tk.LEFT, padx=10)
         ttk.Entry(row, textvariable=self.min_data_points_var, width=8).pack(side=tk.LEFT)
 
-        # Section 4: Optimization
-        f4 = ttk.LabelFrame(main, text="4. Optimization", padding=10)
+        # Section 4: Optimization Algorithm
+        f4 = ttk.LabelFrame(main, text="4. Optimization Algorithm", padding=10)
         f4.pack(fill=tk.X, pady=5, padx=10)
 
         row = ttk.Frame(f4)
         row.pack(fill=tk.X, pady=3)
-        ttk.Label(row, text="Max Iterations:").pack(side=tk.LEFT)
+        ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
+        algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Hybrid GA + Nastran')
+        algo_combo.pack(side=tk.LEFT, padx=5)
+        algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
+
+        ttk.Label(row, text="Max Iterations:").pack(side=tk.LEFT, padx=10)
         ttk.Entry(row, textvariable=self.max_iterations, width=8).pack(side=tk.LEFT, padx=5)
+
+        # GA Parameters Frame
+        self.ga_frame = ttk.LabelFrame(f4, text="GA Parameters", padding=5)
+        self.ga_frame.pack(fill=tk.X, pady=5)
+
+        row = ttk.Frame(self.ga_frame)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Population:").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.ga_population, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row, text="Generations:").pack(side=tk.LEFT, padx=10)
+        ttk.Entry(row, textvariable=self.ga_generations, width=8).pack(side=tk.LEFT, padx=5)
+
+        row = ttk.Frame(self.ga_frame)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Mutation Rate:").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.ga_mutation_rate, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row, text="Crossover Rate:").pack(side=tk.LEFT, padx=10)
+        ttk.Entry(row, textvariable=self.ga_crossover_rate, width=8).pack(side=tk.LEFT, padx=5)
+
+        # Initially hide GA parameters
+        self.ga_frame.pack_forget()
 
         # Section 5: Actions
         f5 = ttk.LabelFrame(main, text="5. Actions", padding=10)
@@ -224,9 +267,20 @@ class ThicknessIterationTool:
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         self.log("="*70)
-        self.log("Thickness Iteration Tool v2.1")
-        self.log("Per-property optimization with RF Check v2.1 allowable logic")
+        self.log("Thickness Iteration Tool v3.0")
+        self.log("Per-property optimization with 3 algorithms")
+        self.log("  1. Simple Iterative")
+        self.log("  2. Fast GA (Surrogate Model)")
+        self.log("  3. Hybrid GA + Nastran")
         self.log("="*70)
+
+    def _on_algorithm_change(self, event=None):
+        """Show/hide GA parameters based on selected algorithm."""
+        algo = self.algorithm_var.get()
+        if 'GA' in algo:
+            self.ga_frame.pack(fill=tk.X, pady=5)
+        else:
+            self.ga_frame.pack_forget()
 
     def log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
@@ -797,16 +851,26 @@ class ThicknessIterationTool:
         self.iteration_results = []
         self.best_solution = None
 
-        threading.Thread(target=self._run_optimization, daemon=True).start()
+        # Route to selected algorithm
+        algo = self.algorithm_var.get()
+        if algo == "Simple Iterative":
+            threading.Thread(target=self._run_simple_iterative, daemon=True).start()
+        elif algo == "Fast GA (Surrogate)":
+            threading.Thread(target=self._run_fast_ga, daemon=True).start()
+        elif algo == "Hybrid GA + Nastran":
+            threading.Thread(target=self._run_hybrid_ga, daemon=True).start()
+        else:
+            threading.Thread(target=self._run_simple_iterative, daemon=True).start()
 
     def stop_optimization(self):
         self.is_running = False
         self.log("\n*** STOPPING ***")
 
-    def _run_optimization(self):
+    def _run_simple_iterative(self):
+        """Algorithm 1: Simple Iterative - increase failing, decrease over-designed."""
         try:
             self.log("\n" + "="*70)
-            self.log("STARTING PER-PROPERTY OPTIMIZATION")
+            self.log("ALGORITHM: SIMPLE ITERATIVE")
             self.log("="*70)
 
             bar_min = float(self.bar_min_thickness.get())
@@ -890,6 +954,453 @@ class ThicknessIterationTool:
         finally:
             self.is_running = False
             self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    # ==================== FAST GA (SURROGATE MODEL) ====================
+    def _run_fast_ga(self):
+        """Algorithm 2: Fast GA with surrogate model (no Nastran during optimization)."""
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: FAST GA (SURROGATE MODEL)")
+            self.log("="*70)
+
+            # Parameters
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+
+            pop_size = int(self.ga_population.get())
+            n_generations = int(self.ga_generations.get())
+            mutation_rate = float(self.ga_mutation_rate.get())
+            crossover_rate = float(self.ga_crossover_rate.get())
+
+            self.log(f"\nGA Parameters:")
+            self.log(f"  Population: {pop_size}")
+            self.log(f"  Generations: {n_generations}")
+            self.log(f"  Mutation Rate: {mutation_rate}")
+            self.log(f"  Crossover Rate: {crossover_rate}")
+            self.log(f"\nTarget RF: {target_rf} ± {rf_tol}")
+
+            # Create chromosome structure
+            bar_pids = list(self.bar_properties.keys())
+            skin_pids = list(self.skin_properties.keys())
+            n_bars = len(bar_pids)
+            n_skins = len(skin_pids)
+            n_genes = n_bars + n_skins
+
+            self.log(f"\nChromosome: {n_bars} bar + {n_skins} skin = {n_genes} genes")
+
+            if n_genes == 0:
+                self.log("ERROR: No properties to optimize!")
+                return
+
+            # Initialize reference stresses (using average from allowable data)
+            self._init_reference_stresses(bar_pids, skin_pids, bar_min, skin_min)
+
+            # Initialize population
+            population = []
+            for _ in range(pop_size):
+                chromosome = []
+                # Bar thicknesses
+                for pid in bar_pids:
+                    chromosome.append(random.uniform(bar_min, bar_max))
+                # Skin thicknesses
+                for pid in skin_pids:
+                    chromosome.append(random.uniform(skin_min, skin_max))
+                population.append(chromosome)
+
+            # Evolution
+            best_fitness = float('inf')
+            best_chromosome = None
+            fitness_history = []
+
+            for gen in range(n_generations):
+                if not self.is_running:
+                    break
+
+                # Evaluate fitness
+                fitness_values = []
+                for chromosome in population:
+                    fit = self._evaluate_surrogate_fitness(
+                        chromosome, bar_pids, skin_pids,
+                        bar_min, bar_max, skin_min, skin_max,
+                        target_rf, rf_tol
+                    )
+                    fitness_values.append(fit)
+
+                # Find best
+                min_fit_idx = fitness_values.index(min(fitness_values))
+                if fitness_values[min_fit_idx] < best_fitness:
+                    best_fitness = fitness_values[min_fit_idx]
+                    best_chromosome = population[min_fit_idx].copy()
+
+                fitness_history.append(best_fitness)
+
+                # Progress update
+                if gen % 10 == 0 or gen == n_generations - 1:
+                    self.update_progress((gen / n_generations) * 100, f"Generation {gen}/{n_generations}")
+                    self.log(f"Gen {gen}: Best Fitness = {best_fitness:.6f}")
+
+                # Selection (Tournament)
+                new_population = []
+                while len(new_population) < pop_size:
+                    # Tournament selection
+                    idx1, idx2 = random.sample(range(pop_size), 2)
+                    parent1 = population[idx1] if fitness_values[idx1] < fitness_values[idx2] else population[idx2]
+
+                    idx3, idx4 = random.sample(range(pop_size), 2)
+                    parent2 = population[idx3] if fitness_values[idx3] < fitness_values[idx4] else population[idx4]
+
+                    # Crossover (BLX-alpha)
+                    if random.random() < crossover_rate:
+                        child = self._blx_crossover(parent1, parent2, alpha=0.5)
+                    else:
+                        child = parent1.copy()
+
+                    # Mutation (Gaussian)
+                    child = self._gaussian_mutation(
+                        child, mutation_rate, n_bars,
+                        bar_min, bar_max, skin_min, skin_max
+                    )
+
+                    new_population.append(child)
+
+                population = new_population
+
+            # Apply best solution
+            if best_chromosome:
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = best_chromosome[i]
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = best_chromosome[n_bars + i]
+
+                # Calculate final weight and RF
+                weight = self._calculate_weight()
+                min_rf = self._estimate_min_rf(best_chromosome, bar_pids, skin_pids)
+
+                self.best_solution = {
+                    'iteration': n_generations,
+                    'min_rf': min_rf,
+                    'weight': weight,
+                    'bar_thicknesses': self.current_bar_thicknesses.copy(),
+                    'skin_thicknesses': self.current_skin_thicknesses.copy(),
+                    'n_fail': 0 if min_rf >= target_rf else 1
+                }
+
+                self.log("\n" + "="*70)
+                self.log("FAST GA COMPLETE")
+                self.log("="*70)
+                self.log(f"\nBest Solution:")
+                self.log(f"  Weight: {weight:.6f} tonnes")
+                self.log(f"  Estimated Min RF: {min_rf:.4f}")
+                self.log(f"  Fitness: {best_fitness:.6f}")
+
+                self._update_ui()
+
+                # Save results
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_folder = os.path.join(self.output_folder.get(), f"fast_ga_{timestamp}")
+                os.makedirs(base_folder, exist_ok=True)
+                self._save_results(base_folder)
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Fast GA Complete",
+                    f"Optimization finished!\n\nWeight: {weight:.6f}t\nEstimated RF: {min_rf:.4f}\n\nNote: Run Nastran to verify results."
+                ))
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _init_reference_stresses(self, bar_pids, skin_pids, bar_ref_t, skin_ref_t):
+        """Initialize reference stresses for surrogate model."""
+        self.reference_stresses = {}
+        self.reference_thickness = {}
+
+        # For bars - estimate stress from allowable curve (assuming RF=1 at some thickness)
+        for pid in bar_pids:
+            if pid in self.allowable_interp:
+                params = self.allowable_interp[pid]
+                # Reference: at min thickness, stress ≈ allowable (RF=1)
+                ref_allow = params['a'] * (bar_ref_t ** params['b'])
+                self.reference_stresses[pid] = ref_allow  # Stress = Allowable when RF=1
+                self.reference_thickness[pid] = bar_ref_t
+            else:
+                self.reference_stresses[pid] = 100.0  # Default
+                self.reference_thickness[pid] = bar_ref_t
+
+        # For skins
+        for pid in skin_pids:
+            if pid in self.allowable_interp:
+                params = self.allowable_interp[pid]
+                ref_allow = params['a'] * (skin_ref_t ** params['b'])
+                self.reference_stresses[pid] = ref_allow
+                self.reference_thickness[pid] = skin_ref_t
+            else:
+                self.reference_stresses[pid] = 100.0
+                self.reference_thickness[pid] = skin_ref_t
+
+    def _evaluate_surrogate_fitness(self, chromosome, bar_pids, skin_pids,
+                                     bar_min, bar_max, skin_min, skin_max,
+                                     target_rf, rf_tol):
+        """Evaluate fitness using surrogate model (no Nastran)."""
+        n_bars = len(bar_pids)
+
+        # Calculate weight
+        weight = 0.0
+
+        # Bar weight
+        for i, pid in enumerate(bar_pids):
+            t = chromosome[i]
+            rho = self.get_density(pid)
+            if pid in self.prop_elements:
+                length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
+                weight += length * t * t * rho
+
+        # Skin weight
+        for i, pid in enumerate(skin_pids):
+            t = chromosome[n_bars + i]
+            rho = self.get_density(pid)
+            if pid in self.prop_elements:
+                area = sum(self.element_areas.get(eid, 0) for eid in self.prop_elements[pid])
+                weight += area * t * rho
+
+        # Calculate RF penalty using surrogate model
+        penalty = 0.0
+        penalty_factor = 1000.0  # Large penalty for constraint violation
+
+        # Bar RF
+        for i, pid in enumerate(bar_pids):
+            t = chromosome[i]
+            rf = self._estimate_rf_surrogate(pid, t, is_bar=True)
+            if rf < target_rf:
+                penalty += penalty_factor * (target_rf - rf) ** 2
+
+        # Skin RF
+        for i, pid in enumerate(skin_pids):
+            t = chromosome[n_bars + i]
+            rf = self._estimate_rf_surrogate(pid, t, is_bar=False)
+            if rf < target_rf:
+                penalty += penalty_factor * (target_rf - rf) ** 2
+
+        return weight + penalty
+
+    def _estimate_rf_surrogate(self, pid, thickness, is_bar=True):
+        """Estimate RF using surrogate model: Stress scales with thickness."""
+        if pid not in self.allowable_interp:
+            return 1.0  # Default pass
+
+        params = self.allowable_interp[pid]
+        allowable = params['a'] * (thickness ** params['b'])
+
+        # Stress scaling: Stress ∝ 1/t^α (α=1.0 for bars, 1.5 for skins)
+        alpha = 1.0 if is_bar else 1.5
+        ref_stress = self.reference_stresses.get(pid, 100.0)
+        ref_t = self.reference_thickness.get(pid, thickness)
+
+        if ref_t > 0 and thickness > 0:
+            stress = ref_stress * (ref_t / thickness) ** alpha
+        else:
+            stress = ref_stress
+
+        if stress > 0:
+            return allowable / stress
+        return 999.0
+
+    def _estimate_min_rf(self, chromosome, bar_pids, skin_pids):
+        """Estimate minimum RF from chromosome."""
+        min_rf = 999.0
+        n_bars = len(bar_pids)
+
+        for i, pid in enumerate(bar_pids):
+            rf = self._estimate_rf_surrogate(pid, chromosome[i], is_bar=True)
+            min_rf = min(min_rf, rf)
+
+        for i, pid in enumerate(skin_pids):
+            rf = self._estimate_rf_surrogate(pid, chromosome[n_bars + i], is_bar=False)
+            min_rf = min(min_rf, rf)
+
+        return min_rf
+
+    def _blx_crossover(self, parent1, parent2, alpha=0.5):
+        """BLX-alpha crossover for real-valued chromosomes."""
+        child = []
+        for g1, g2 in zip(parent1, parent2):
+            min_g, max_g = min(g1, g2), max(g1, g2)
+            range_g = max_g - min_g
+            child.append(random.uniform(min_g - alpha * range_g, max_g + alpha * range_g))
+        return child
+
+    def _gaussian_mutation(self, chromosome, mutation_rate, n_bars,
+                           bar_min, bar_max, skin_min, skin_max):
+        """Gaussian mutation with bounds."""
+        mutated = chromosome.copy()
+        for i in range(len(mutated)):
+            if random.random() < mutation_rate:
+                if i < n_bars:
+                    # Bar gene
+                    sigma = (bar_max - bar_min) * 0.1
+                    mutated[i] += random.gauss(0, sigma)
+                    mutated[i] = max(bar_min, min(bar_max, mutated[i]))
+                else:
+                    # Skin gene
+                    sigma = (skin_max - skin_min) * 0.1
+                    mutated[i] += random.gauss(0, sigma)
+                    mutated[i] = max(skin_min, min(skin_max, mutated[i]))
+        return mutated
+
+    # ==================== HYBRID GA + NASTRAN ====================
+    def _run_hybrid_ga(self):
+        """Algorithm 3: Hybrid GA - Fast GA first, then Nastran validation."""
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: HYBRID GA + NASTRAN")
+            self.log("="*70)
+
+            # Phase 1: Run Fast GA
+            self.log("\n>>> PHASE 1: Fast GA Optimization <<<")
+            self._run_fast_ga_internal()
+
+            if not self.is_running:
+                return
+
+            # Phase 2: Nastran validation of best solutions
+            self.log("\n>>> PHASE 2: Nastran Validation <<<")
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"hybrid_ga_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            target_rf = float(self.target_rf.get())
+
+            # Run Nastran with best solution
+            self.log("\nValidating best solution with Nastran...")
+            iter_folder = os.path.join(base_folder, "validation")
+            os.makedirs(iter_folder, exist_ok=True)
+
+            result = self._run_iteration(iter_folder, 1, target_rf)
+
+            if result:
+                self.best_solution = result
+                self.log(f"\nNastran Validation Results:")
+                self.log(f"  Actual Min RF: {result['min_rf']:.4f}")
+                self.log(f"  Actual Weight: {result['weight']:.6f}t")
+                self.log(f"  Failures: {result['n_fail']}")
+
+                self._update_ui()
+                self._save_results(base_folder)
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Hybrid GA Complete",
+                    f"Optimization finished!\n\nWeight: {result['weight']:.6f}t\nActual RF: {result['min_rf']:.4f}\nFailures: {result['n_fail']}"
+                ))
+            else:
+                self.log("ERROR: Nastran validation failed!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_fast_ga_internal(self):
+        """Internal Fast GA without UI cleanup (for Hybrid)."""
+        # Parameters
+        bar_min = float(self.bar_min_thickness.get())
+        bar_max = float(self.bar_max_thickness.get())
+        skin_min = float(self.skin_min_thickness.get())
+        skin_max = float(self.skin_max_thickness.get())
+        target_rf = float(self.target_rf.get())
+        rf_tol = float(self.rf_tolerance.get())
+
+        pop_size = int(self.ga_population.get())
+        n_generations = int(self.ga_generations.get())
+        mutation_rate = float(self.ga_mutation_rate.get())
+        crossover_rate = float(self.ga_crossover_rate.get())
+
+        bar_pids = list(self.bar_properties.keys())
+        skin_pids = list(self.skin_properties.keys())
+        n_bars = len(bar_pids)
+        n_genes = n_bars + len(skin_pids)
+
+        if n_genes == 0:
+            return
+
+        self._init_reference_stresses(bar_pids, skin_pids, bar_min, skin_min)
+
+        # Initialize population
+        population = []
+        for _ in range(pop_size):
+            chromosome = []
+            for pid in bar_pids:
+                chromosome.append(random.uniform(bar_min, bar_max))
+            for pid in skin_pids:
+                chromosome.append(random.uniform(skin_min, skin_max))
+            population.append(chromosome)
+
+        best_fitness = float('inf')
+        best_chromosome = None
+
+        for gen in range(n_generations):
+            if not self.is_running:
+                break
+
+            fitness_values = []
+            for chromosome in population:
+                fit = self._evaluate_surrogate_fitness(
+                    chromosome, bar_pids, skin_pids,
+                    bar_min, bar_max, skin_min, skin_max,
+                    target_rf, rf_tol
+                )
+                fitness_values.append(fit)
+
+            min_fit_idx = fitness_values.index(min(fitness_values))
+            if fitness_values[min_fit_idx] < best_fitness:
+                best_fitness = fitness_values[min_fit_idx]
+                best_chromosome = population[min_fit_idx].copy()
+
+            if gen % 20 == 0:
+                self.update_progress((gen / n_generations) * 50, f"GA Gen {gen}/{n_generations}")
+                self.log(f"  Gen {gen}: Fitness = {best_fitness:.6f}")
+
+            # Evolution
+            new_population = []
+            while len(new_population) < pop_size:
+                idx1, idx2 = random.sample(range(pop_size), 2)
+                parent1 = population[idx1] if fitness_values[idx1] < fitness_values[idx2] else population[idx2]
+
+                idx3, idx4 = random.sample(range(pop_size), 2)
+                parent2 = population[idx3] if fitness_values[idx3] < fitness_values[idx4] else population[idx4]
+
+                if random.random() < crossover_rate:
+                    child = self._blx_crossover(parent1, parent2)
+                else:
+                    child = parent1.copy()
+
+                child = self._gaussian_mutation(child, mutation_rate, n_bars,
+                                                bar_min, bar_max, skin_min, skin_max)
+                new_population.append(child)
+
+            population = new_population
+
+        # Apply best solution
+        if best_chromosome:
+            for i, pid in enumerate(bar_pids):
+                self.current_bar_thicknesses[pid] = best_chromosome[i]
+            for i, pid in enumerate(skin_pids):
+                self.current_skin_thicknesses[pid] = best_chromosome[n_bars + i]
+
+            self.log(f"\nFast GA Result: Fitness = {best_fitness:.6f}")
 
     def _run_iteration(self, folder, iteration, target_rf):
         try:
