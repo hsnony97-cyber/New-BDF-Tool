@@ -441,11 +441,8 @@ class ThicknessIterationTool:
                 clean_cols[col] = clean_name
             raw_df = raw_df.rename(columns=clean_cols)
 
-            # Map column names (RF Check v2.1 exact mapping)
-            # IMPORTANT: Only map ONE column to Thickness to avoid duplicate columns
+            # Map column names (RF Check v2.1 EXACT mapping)
             col_map = {}
-            thickness_col_found = None
-
             for col in raw_df.columns:
                 col_up = col.upper().replace(' ', '_').replace('BAR_', '').replace('(MM)', '').strip('_')
 
@@ -455,25 +452,10 @@ class ThicknessIterationTool:
                     col_map[col] = 'Element_ID'
                 elif col_up in ['ELEMENT_TYPE', 'ELEMENT_TYP']:
                     col_map[col] = 'Element_Type'
+                elif col_up in ['T', 'THICKNESS', 'T_MM']:
+                    col_map[col] = 'Thickness'
                 elif col_up in ['ALLOWABLE', 'ALLOW', 'ALLOWABLE_STRESS']:
                     col_map[col] = 'Allowable'
-
-            # Find thickness column - prioritize 'd' for bar data, then 't'
-            for col in raw_df.columns:
-                col_up = col.upper().replace(' ', '_').replace('BAR_', '').replace('(MM)', '').strip('_')
-                if col_up == 'D' and thickness_col_found is None:
-                    thickness_col_found = col
-                    col_map[col] = 'Thickness'
-                    break
-
-            # If no 'd' column, look for 't' or 'thickness'
-            if thickness_col_found is None:
-                for col in raw_df.columns:
-                    col_up = col.upper().replace(' ', '_').replace('BAR_', '').replace('(MM)', '').strip('_')
-                    if col_up in ['T', 'THICKNESS', 'T_MM'] and thickness_col_found is None:
-                        thickness_col_found = col
-                        col_map[col] = 'Thickness'
-                        break
 
             self.log(f"\nColumn mapping:")
             for orig, mapped in col_map.items():
@@ -647,9 +629,24 @@ class ThicknessIterationTool:
                     except:
                         self.allowable_elem_interp[elem_int] = {'a': 100, 'b': 0, 'n_pts': n_pts, 'r2': 0, 'excluded': True, 'property': elem_pid_int}
 
-                self.log(f"Valid element fits: {len(valid_elems)}")
+                # Count excluded elements
+                excluded_elem_r2 = sum(1 for e in self.allowable_elem_interp.values() if e.get('excluded') and e.get('r2', 0) > 0)
+                excluded_elem_data = sum(1 for e in self.allowable_elem_interp.values() if e.get('excluded') and e.get('n_pts', 0) < min_data_pts)
 
-            self.allow_status.config(text=f"✓ Prop: {len(valid_props)}, Elem: {len(self.allowable_elem_interp)}", foreground="green")
+                self.log(f"Valid element fits (R² >= {r2_threshold}): {len(valid_elems)}")
+                self.log(f"Excluded elements (R² < {r2_threshold}): {excluded_elem_r2}")
+                self.log(f"Excluded elements (data < {min_data_pts}): {excluded_elem_data}")
+
+                if valid_elems:
+                    self.log(f"\nSample valid fits (Element):")
+                    for eid in valid_elems[:5]:
+                        e = self.allowable_elem_interp[eid]
+                        self.log(f"  Element {eid}: Allow = {e['a']:.4f} × T^({e['b']:.4f}), R²={e['r2']:.4f}")
+
+            # RF Check v2.1 format status
+            n_elem_valid = len(valid_elems) if 'valid_elems' in dir() else 0
+            n_elem_excl = len(self.allowable_elem_interp) - n_elem_valid if self.allowable_elem_interp else 0
+            self.allow_status.config(text=f"✓ Prop: {len(valid_props)} valid | Elem: {n_elem_valid} valid, {n_elem_excl} excl", foreground="green")
 
         except Exception as e:
             self.log(f"ERROR: {e}")
