@@ -1681,25 +1681,52 @@ class ThicknessIterationTool:
                     try:
                         eid = int(line[8:16].strip())
                         if eid in bar_offsets:
-                            vec = bar_offsets[eid]
-                            # Add continuation marker to main line
-                            cont_name = '+' + str(eid)[-7:]
-                            main_line = line.rstrip()
-                            if len(main_line) < 72:
-                                main_line = main_line.ljust(72)
-                            main_line = main_line[:72] + cont_name + '\n'
-                            new_lines.append(main_line)
+                            offset_vec = bar_offsets[eid]
 
-                            # Continuation line: WA(3) and WB(3)
-                            cont_line = cont_name.ljust(8)
-                            cont_line += fmt(vec[0]) + fmt(vec[1]) + fmt(vec[2])  # WA
-                            cont_line += fmt(vec[0]) + fmt(vec[1]) + fmt(vec[2])  # WB (same as WA)
-                            cont_line += '\n'
-                            new_lines.append(cont_line)
+                            # Check if next line is continuation (multi-line CBAR)
+                            if i + 1 < len(lines) and (lines[i+1].startswith('+') or lines[i+1].startswith('*') or (lines[i+1][0] == ' ' and lines[i+1].strip())):
+                                # Multi-line CBAR - modify existing continuation line
+                                # Keep first 24 chars (cont marker + PA + PB), replace WA/WB
+                                cont_line = lines[i+1]
+                                # Ensure cont_line is at least 24 chars
+                                if len(cont_line) < 24:
+                                    cont_line = cont_line.rstrip().ljust(24)
+                                new_cont = cont_line[:24]  # Keep +marker, PA, PB
+                                new_cont += fmt(offset_vec[0])  # W1A (pos 24-32)
+                                new_cont += fmt(offset_vec[1])  # W2A (pos 32-40)
+                                new_cont += fmt(offset_vec[2])  # W3A (pos 40-48)
+                                new_cont += fmt(offset_vec[0])  # W1B (pos 48-56)
+                                new_cont += fmt(offset_vec[1])  # W2B (pos 56-64)
+                                new_cont += fmt(offset_vec[2])  # W3B (pos 64-72)
+                                new_cont += '\n'
 
-                            applied_bar += 1
-                            i += 1
-                            continue
+                                new_lines.append(line)
+                                new_lines.append(new_cont)
+                                applied_bar += 1
+                                i += 2
+                                continue
+                            else:
+                                # Single line CBAR - add continuation for offsets
+                                # Add continuation marker to main line
+                                cont_name = '+CB' + str(eid)[-4:]
+                                new_lines.append(line.rstrip() + cont_name + '\n')
+
+                                # Create continuation line: +name, PA(blank), PB(blank), W1A, W2A, W3A, W1B, W2B, W3B
+                                new_cont = cont_name.ljust(8)      # pos 0-7: continuation name
+                                new_cont += '        '              # pos 8-15: PA (blank)
+                                new_cont += '        '              # pos 16-23: PB (blank)
+                                new_cont += fmt(offset_vec[0])     # pos 24-31: W1A
+                                new_cont += fmt(offset_vec[1])     # pos 32-39: W2A
+                                new_cont += fmt(offset_vec[2])     # pos 40-47: W3A
+                                new_cont += fmt(offset_vec[0])     # pos 48-55: W1B
+                                new_cont += fmt(offset_vec[1])     # pos 56-63: W2B
+                                new_cont += fmt(offset_vec[2])     # pos 64-71: W3B
+                                new_cont += '\n'
+                                new_lines.append(new_cont)
+
+                                applied_bar += 1
+                                i += 1
+                                continue
                     except:
                         pass
 
