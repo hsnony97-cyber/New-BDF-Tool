@@ -209,7 +209,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Hybrid GA + Nastran')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'Hybrid GA + Nastran')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -934,6 +934,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_fast_ga, daemon=True).start()
         elif algo == "Full GA + Nastran":
             threading.Thread(target=self._run_full_ga_nastran, daemon=True).start()
+        elif algo == "Surrogate-Assisted GA":
+            threading.Thread(target=self._run_surrogate_assisted_ga, daemon=True).start()
         elif algo == "Hybrid GA + Nastran":
             threading.Thread(target=self._run_hybrid_ga, daemon=True).start()
         else:
@@ -1605,6 +1607,416 @@ class ThicknessIterationTool:
         finally:
             self.is_running = False
             self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_surrogate_assisted_ga(self):
+        """Algorithm 5: Surrogate-Assisted GA - learns from previous Nastran runs."""
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: SURROGATE-ASSISTED GA")
+            self.log("(Learns from Nastran results - SMART & EFFICIENT)")
+            self.log("="*70)
+
+            # Parameters
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+
+            pop_size = int(self.ga_population.get())
+            n_generations = int(self.ga_generations.get())
+            mutation_rate = float(self.ga_mutation_rate.get())
+            crossover_rate = float(self.ga_crossover_rate.get())
+
+            # Surrogate parameters
+            initial_samples = min(pop_size, 20)  # Initial Nastran runs to build surrogate
+            nastran_per_gen = max(3, pop_size // 10)  # Nastran runs per generation for update
+
+            self.log(f"\nGA Parameters:")
+            self.log(f"  Population: {pop_size}")
+            self.log(f"  Generations: {n_generations}")
+            self.log(f"  Mutation Rate: {mutation_rate}")
+            self.log(f"  Crossover Rate: {crossover_rate}")
+            self.log(f"\nSurrogate Parameters:")
+            self.log(f"  Initial Nastran samples: {initial_samples}")
+            self.log(f"  Nastran updates per generation: {nastran_per_gen}")
+            self.log(f"\nEstimated total Nastran runs: {initial_samples + n_generations * nastran_per_gen}")
+            self.log(f"(vs Full GA: {pop_size * n_generations})")
+
+            bar_pids = list(self.bar_properties.keys())
+            skin_pids = list(self.skin_properties.keys())
+            n_bars = len(bar_pids)
+            n_skins = len(skin_pids)
+            n_genes = n_bars + n_skins
+
+            if n_genes == 0:
+                self.log("ERROR: No properties to optimize!")
+                return
+
+            self.log(f"\nChromosome: {n_bars} bars + {n_skins} skins = {n_genes} genes")
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"surrogate_ga_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== PHASE 1: Initial Sampling (Latin Hypercube-like) ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: Building Initial Surrogate Model")
+            self.log("="*50)
+
+            # Storage for surrogate training data
+            X_train = []  # Chromosomes (inputs)
+            y_rf_train = []  # Min RF values (outputs)
+            y_weight_train = []  # Weight values (outputs)
+
+            # Generate initial samples using stratified random sampling
+            initial_population = []
+            for i in range(initial_samples):
+                chromosome = []
+                for j, pid in enumerate(bar_pids):
+                    # Stratified: divide range into initial_samples parts
+                    low = bar_min + (bar_max - bar_min) * (i / initial_samples)
+                    high = bar_min + (bar_max - bar_min) * ((i + 1) / initial_samples)
+                    chromosome.append(random.uniform(low, high))
+                for j, pid in enumerate(skin_pids):
+                    low = skin_min + (skin_max - skin_min) * (i / initial_samples)
+                    high = skin_min + (skin_max - skin_min) * ((i + 1) / initial_samples)
+                    chromosome.append(random.uniform(low, high))
+                # Shuffle to avoid correlation
+                random.shuffle(chromosome[:n_bars])
+                if n_skins > 0:
+                    random.shuffle(chromosome[n_bars:])
+                initial_population.append(chromosome)
+
+            # Run Nastran for initial samples
+            nastran_count = 0
+            best_fitness = float('-inf')
+            best_chromosome = None
+            best_result = None
+
+            for idx, chromosome in enumerate(initial_population):
+                if not self.is_running:
+                    break
+
+                nastran_count += 1
+                self.log(f"\n  Initial Sample {idx+1}/{initial_samples} (Nastran #{nastran_count})")
+                self.update_progress((idx/initial_samples)*20, f"Initial sampling {idx+1}/{initial_samples}")
+
+                # Set thicknesses
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = chromosome[i]
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = chromosome[n_bars + i]
+
+                # Run Nastran
+                iter_folder = os.path.join(base_folder, f"init_{idx+1:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+                result = self._run_iteration(iter_folder, nastran_count, target_rf)
+
+                if result:
+                    min_rf = result['min_rf']
+                    weight = result['weight']
+
+                    X_train.append(chromosome)
+                    y_rf_train.append(min_rf)
+                    y_weight_train.append(weight)
+
+                    # Calculate fitness
+                    if min_rf >= target_rf - rf_tol:
+                        fitness = 1000.0 / (weight + 0.001)
+                    else:
+                        penalty = (target_rf - min_rf) * 100
+                        fitness = 1000.0 / (weight + 0.001) - penalty
+
+                    self.log(f"    RF={min_rf:.4f}, Weight={weight:.6f}t, Fitness={fitness:.2f}")
+
+                    if fitness > best_fitness:
+                        best_fitness = fitness
+                        best_chromosome = chromosome.copy()
+                        best_result = result
+                        self.best_solution = result
+                        self.log(f"    *** NEW BEST! ***")
+
+            if len(X_train) < 3:
+                self.log("ERROR: Not enough initial samples!")
+                return
+
+            self.log(f"\n  Surrogate built with {len(X_train)} samples")
+
+            # ========== PHASE 2: GA with Surrogate ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: Surrogate-Assisted Optimization")
+            self.log("="*50)
+
+            # Initialize population (include best from initial + random)
+            population = []
+            if best_chromosome:
+                population.append(best_chromosome.copy())
+
+            while len(population) < pop_size:
+                chromosome = []
+                for pid in bar_pids:
+                    chromosome.append(random.uniform(bar_min, bar_max))
+                for pid in skin_pids:
+                    chromosome.append(random.uniform(skin_min, skin_max))
+                population.append(chromosome)
+
+            for gen in range(n_generations):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*50}")
+                self.log(f"GENERATION {gen+1}/{n_generations}")
+                self.log(f"{'='*50}")
+
+                progress = 20 + (gen / n_generations) * 80
+                self.update_progress(progress, f"Gen {gen+1}/{n_generations}")
+
+                # Evaluate all individuals using SURROGATE
+                fitness_scores = []
+                surrogate_predictions = []
+
+                for idx, chromosome in enumerate(population):
+                    # Surrogate prediction using weighted k-nearest neighbors
+                    pred_rf, pred_weight, confidence = self._surrogate_predict(
+                        chromosome, X_train, y_rf_train, y_weight_train,
+                        bar_min, bar_max, skin_min, skin_max, n_bars
+                    )
+
+                    # Calculate predicted fitness
+                    if pred_rf >= target_rf - rf_tol:
+                        pred_fitness = 1000.0 / (pred_weight + 0.001)
+                    else:
+                        penalty = (target_rf - pred_rf) * 100
+                        pred_fitness = 1000.0 / (pred_weight + 0.001) - penalty
+
+                    fitness_scores.append(pred_fitness)
+                    surrogate_predictions.append({
+                        'chromosome': chromosome,
+                        'pred_rf': pred_rf,
+                        'pred_weight': pred_weight,
+                        'pred_fitness': pred_fitness,
+                        'confidence': confidence
+                    })
+
+                # Select top candidates for actual Nastran evaluation
+                # Criteria: high predicted fitness OR low confidence (exploration)
+                sorted_by_fitness = sorted(surrogate_predictions, key=lambda x: x['pred_fitness'], reverse=True)
+                sorted_by_uncertainty = sorted(surrogate_predictions, key=lambda x: x['confidence'])
+
+                candidates_for_nastran = []
+                # Top performers (exploitation)
+                for item in sorted_by_fitness[:nastran_per_gen // 2]:
+                    if item['chromosome'] not in [c['chromosome'] for c in candidates_for_nastran]:
+                        candidates_for_nastran.append(item)
+                # Most uncertain (exploration)
+                for item in sorted_by_uncertainty[:nastran_per_gen // 2 + 1]:
+                    if item['chromosome'] not in [c['chromosome'] for c in candidates_for_nastran]:
+                        candidates_for_nastran.append(item)
+
+                candidates_for_nastran = candidates_for_nastran[:nastran_per_gen]
+
+                # Run Nastran for selected candidates
+                self.log(f"\n  Running Nastran for {len(candidates_for_nastran)} candidates...")
+
+                for cand in candidates_for_nastran:
+                    if not self.is_running:
+                        break
+
+                    chromosome = cand['chromosome']
+                    nastran_count += 1
+
+                    # Set thicknesses
+                    for i, pid in enumerate(bar_pids):
+                        self.current_bar_thicknesses[pid] = chromosome[i]
+                    for i, pid in enumerate(skin_pids):
+                        self.current_skin_thicknesses[pid] = chromosome[n_bars + i]
+
+                    # Run Nastran
+                    iter_folder = os.path.join(base_folder, f"gen_{gen+1:03d}_eval_{nastran_count:03d}")
+                    os.makedirs(iter_folder, exist_ok=True)
+                    result = self._run_iteration(iter_folder, nastran_count, target_rf)
+
+                    if result:
+                        min_rf = result['min_rf']
+                        weight = result['weight']
+
+                        # Update surrogate training data
+                        X_train.append(chromosome)
+                        y_rf_train.append(min_rf)
+                        y_weight_train.append(weight)
+
+                        # Calculate actual fitness
+                        if min_rf >= target_rf - rf_tol:
+                            actual_fitness = 1000.0 / (weight + 0.001)
+                        else:
+                            penalty = (target_rf - min_rf) * 100
+                            actual_fitness = 1000.0 / (weight + 0.001) - penalty
+
+                        pred_rf = cand['pred_rf']
+                        self.log(f"    Nastran #{nastran_count}: Pred RF={pred_rf:.3f} → Actual RF={min_rf:.4f}, Weight={weight:.6f}t")
+
+                        # Update best
+                        if actual_fitness > best_fitness:
+                            best_fitness = actual_fitness
+                            best_chromosome = chromosome.copy()
+                            best_result = result
+                            self.best_solution = result
+                            self.log(f"    *** NEW BEST! ***")
+
+                        # Update fitness score in population
+                        for i, p in enumerate(population):
+                            if p == chromosome:
+                                fitness_scores[i] = actual_fitness
+                                break
+
+                # Selection and reproduction
+                def tournament_select(pop, fit, k=3):
+                    indices = random.sample(range(len(pop)), min(k, len(pop)))
+                    best_idx = max(indices, key=lambda i: fit[i])
+                    return pop[best_idx]
+
+                new_population = []
+                if best_chromosome:
+                    new_population.append(best_chromosome.copy())
+
+                while len(new_population) < pop_size:
+                    parent1 = tournament_select(population, fitness_scores)
+                    parent2 = tournament_select(population, fitness_scores)
+
+                    # BLX-α crossover
+                    if random.random() < crossover_rate:
+                        child = []
+                        alpha = 0.5
+                        for i, (g1, g2) in enumerate(zip(parent1, parent2)):
+                            d = abs(g2 - g1)
+                            if i < n_bars:
+                                low = max(bar_min, min(g1, g2) - alpha * d)
+                                high = min(bar_max, max(g1, g2) + alpha * d)
+                            else:
+                                low = max(skin_min, min(g1, g2) - alpha * d)
+                                high = min(skin_max, max(g1, g2) + alpha * d)
+                            child.append(random.uniform(low, high))
+                    else:
+                        child = parent1.copy()
+
+                    # Gaussian mutation
+                    for i in range(len(child)):
+                        if random.random() < mutation_rate:
+                            if i < n_bars:
+                                sigma = (bar_max - bar_min) * 0.1
+                                child[i] = max(bar_min, min(bar_max, child[i] + random.gauss(0, sigma)))
+                            else:
+                                sigma = (skin_max - skin_min) * 0.1
+                                child[i] = max(skin_min, min(skin_max, child[i] + random.gauss(0, sigma)))
+
+                    new_population.append(child)
+
+                population = new_population[:pop_size]
+
+                # Log generation summary
+                self.log(f"\n  Gen {gen+1}: Best Fitness={best_fitness:.2f}, Surrogate samples={len(X_train)}")
+
+            # ========== Final Results ==========
+            self.log("\n" + "="*70)
+            self.log("SURROGATE-ASSISTED GA COMPLETE")
+            self.log("="*70)
+            self.log(f"Total Nastran evaluations: {nastran_count}")
+            self.log(f"Surrogate model size: {len(X_train)} samples")
+
+            if best_result:
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = best_chromosome[i]
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = best_chromosome[n_bars + i]
+
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {best_result['min_rf']:.4f}")
+                self.log(f"  Weight: {best_result['weight']:.6f}t")
+                self.log(f"  Failures: {best_result['n_fail']}")
+
+                self._update_ui()
+                self._save_results(base_folder)
+
+                # Save surrogate training data
+                surrogate_data = []
+                for i in range(len(X_train)):
+                    row = {'RF': y_rf_train[i], 'Weight': y_weight_train[i]}
+                    for j, pid in enumerate(bar_pids):
+                        row[f'Bar_{pid}'] = X_train[i][j]
+                    for j, pid in enumerate(skin_pids):
+                        row[f'Skin_{pid}'] = X_train[i][n_bars + j]
+                    surrogate_data.append(row)
+                pd.DataFrame(surrogate_data).to_csv(os.path.join(base_folder, "surrogate_data.csv"), index=False)
+                self.log(f"\nSurrogate training data saved to surrogate_data.csv")
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Surrogate-Assisted GA Complete",
+                    f"Optimization finished!\n\nNastran evaluations: {nastran_count}\nWeight: {best_result['weight']:.6f}t\nMin RF: {best_result['min_rf']:.4f}"
+                ))
+            else:
+                self.log("ERROR: No valid solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _surrogate_predict(self, chromosome, X_train, y_rf_train, y_weight_train,
+                           bar_min, bar_max, skin_min, skin_max, n_bars):
+        """Predict RF and Weight using weighted k-nearest neighbors (RBF-like)."""
+        if len(X_train) == 0:
+            return 0.5, 1.0, 0.0  # Default prediction, low confidence
+
+        # Normalize chromosome
+        def normalize(chrom):
+            norm = []
+            for i, val in enumerate(chrom):
+                if i < n_bars:
+                    norm.append((val - bar_min) / (bar_max - bar_min + 1e-10))
+                else:
+                    norm.append((val - skin_min) / (skin_max - skin_min + 1e-10))
+            return norm
+
+        norm_query = normalize(chromosome)
+
+        # Calculate distances to all training points
+        distances = []
+        for i, x in enumerate(X_train):
+            norm_x = normalize(x)
+            dist = sum((a - b) ** 2 for a, b in zip(norm_query, norm_x)) ** 0.5
+            distances.append((dist, i))
+
+        # Sort by distance and take k nearest
+        k = min(5, len(X_train))
+        distances.sort(key=lambda x: x[0])
+        nearest = distances[:k]
+
+        # Weighted average (inverse distance weighting)
+        epsilon = 1e-6
+        total_weight = 0
+        pred_rf = 0
+        pred_wt = 0
+
+        for dist, idx in nearest:
+            w = 1.0 / (dist + epsilon)
+            total_weight += w
+            pred_rf += w * y_rf_train[idx]
+            pred_wt += w * y_weight_train[idx]
+
+        pred_rf /= total_weight
+        pred_wt /= total_weight
+
+        # Confidence based on average distance to nearest neighbors
+        avg_dist = sum(d for d, _ in nearest) / k
+        confidence = 1.0 / (1.0 + avg_dist * 10)  # Higher distance = lower confidence
+
+        return pred_rf, pred_wt, confidence
 
     def _run_fast_ga_internal(self):
         """Internal Fast GA without UI cleanup (for Hybrid)."""
