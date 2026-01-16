@@ -41,6 +41,7 @@ class ThicknessIterationTool:
         self.allowable_excel_path = tk.StringVar()
         self.property_excel_path = tk.StringVar()
         self.element_excel_path = tk.StringVar()
+        self.residual_strength_path = tk.StringVar()  # NEW: Residual Strength Excel
         self.nastran_path = tk.StringVar()
         self.output_folder = tk.StringVar()
 
@@ -91,6 +92,10 @@ class ThicknessIterationTool:
         self.allowable_elem_interp = {}  # EID -> {a, b, r2, excluded, property}
         self.allowable_df = None
 
+        # Residual Strength data for stress combination
+        self.residual_strength_df = None
+        self.combination_table = []  # [(case_col, mult_col), ...]
+
         # Reference stresses for surrogate model
         self.reference_stresses = {}  # PID -> stress at reference thickness
         self.reference_thickness = {}  # PID -> reference thickness
@@ -129,6 +134,7 @@ class ThicknessIterationTool:
             ("Main BDF:", self.input_bdf_path, self.load_bdf, "bdf_status"),
             ("Property Excel:", self.property_excel_path, self.load_properties, "prop_status"),
             ("Allowable Excel:", self.allowable_excel_path, self.rf_load_allowable, "allow_status"),
+            ("Residual Strength:", self.residual_strength_path, self.load_residual_strength, "resid_status"),
             ("Offset Element IDs:", self.element_excel_path, self.load_element_ids, "elem_status"),
         ]:
             row = ttk.Frame(f1)
@@ -789,6 +795,75 @@ class ThicknessIterationTool:
             self.log(f"ERROR: {e}")
             self.elem_status.config(text="Error", foreground="red")
 
+    def load_residual_strength(self):
+        """Load Residual Strength Excel for stress combination - RF Check Tool logic."""
+        path = self.residual_strength_path.get()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Error", "Select Residual Strength Excel file")
+            return
+
+        self.log("\n" + "="*70)
+        self.log("LOADING RESIDUAL STRENGTH DATA")
+        self.log("="*70)
+
+        try:
+            xl = pd.ExcelFile(path)
+            self.log(f"Sheets: {xl.sheet_names}")
+
+            # Find Residual Strength sheet (RF Check Tool logic)
+            res_sh = None
+            for sheet in xl.sheet_names:
+                sl = sheet.lower().replace(' ', '').replace('_', '')
+                if sl == 'residualstrength' or sl == 'residual strength':
+                    res_sh = sheet
+                    break
+
+            # Fallback - search for sheets containing 'residual' or 'strength'
+            if not res_sh:
+                for sheet in xl.sheet_names:
+                    sl = sheet.lower()
+                    if 'residual' in sl or 'strength' in sl:
+                        res_sh = sheet
+                        break
+
+            if not res_sh:
+                # Use first sheet if no specific sheet found
+                res_sh = xl.sheet_names[0]
+                self.log(f"  No 'Residual Strength' sheet found, using: {res_sh}")
+            else:
+                self.log(f"  Found Residual Strength sheet: {res_sh}")
+
+            self.residual_strength_df = pd.read_excel(xl, sheet_name=res_sh)
+            self.log(f"  Loaded {len(self.residual_strength_df)} rows")
+            self.log(f"  Columns: {list(self.residual_strength_df.columns)}")
+
+            # Parse combination table structure (first col = Combined LC, then pairs of Case/Mult)
+            cols = self.residual_strength_df.columns.tolist()
+            comb_col = cols[0]
+            self.log(f"  Combined LC column: {comb_col}")
+
+            # Find Case ID + Multiplier column pairs
+            self.combination_table = []
+            i = 1
+            while i < len(cols) - 1:
+                col_name = str(cols[i]).upper()
+                next_col_name = str(cols[i+1]).upper()
+                if ('CASE' in col_name or 'ID' in col_name) and 'MULT' in next_col_name:
+                    self.combination_table.append((cols[i], cols[i+1]))
+                    self.log(f"    Found pair: {cols[i]} + {cols[i+1]}")
+                    i += 2
+                else:
+                    i += 1
+
+            self.log(f"  Total combination pairs: {len(self.combination_table)}")
+            self.resid_status.config(text=f"✓ {len(self.residual_strength_df)} rows, {len(self.combination_table)} pairs", foreground="green")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            self.resid_status.config(text="Error", foreground="red")
+
     # ==================== HELPER FUNCTIONS ====================
     def get_allowable_stress(self, pid, thickness):
         pid_int = int(pid)
@@ -1431,9 +1506,15 @@ class ThicknessIterationTool:
             self.log("  [4] Extracting stresses...")
             stresses = self._extract_stresses(folder)
 
+            # 4.5 Combine stresses using Residual Strength (if loaded)
+            combined_stresses = None
+            if self.residual_strength_df is not None:
+                self.log("  [4.5] Combining stresses...")
+                combined_stresses = self._combine_stresses(folder)
+
             # 5. Calculate RF
             self.log("  [5] Calculating RF...")
-            rf_results = self._calculate_rf(stresses, target_rf)
+            rf_results = self._calculate_rf(stresses, target_rf, combined_stresses)
 
             # 6. Calculate weight
             self.log("  [6] Calculating weight...")
@@ -1759,38 +1840,173 @@ class ThicknessIterationTool:
             return False
 
     def _extract_stresses(self, folder):
+        """Extract stresses from OP2 using cbar_force (RF Check Tool logic)."""
         results = []
+        bar_stress_rows = []  # For bar_stress_results.csv
+
         for f in os.listdir(folder):
             if f.lower().endswith('.op2'):
+                op2_name = f
                 try:
                     op2 = OP2(debug=False)
                     op2.read_op2(os.path.join(folder, f))
 
-                    if hasattr(op2, 'cbar_stress') and op2.cbar_stress:
-                        for sc_id, data in op2.cbar_stress.items():
-                            for i, eid in enumerate(data.element):
-                                stress = data.data[0, i, 0] if len(data.data.shape) == 3 else data.data[i, 0]
-                                results.append({'eid': int(eid), 'type': 'bar', 'stress': float(stress)})
+                    # BAR STRESS from cbar_force (RF Check Tool exact logic)
+                    if hasattr(op2, 'cbar_force') and op2.cbar_force:
+                        for sc_id, force in op2.cbar_force.items():
+                            for i, eid in enumerate(force.element):
+                                # Axial force at index 6 (bending moment MA1)
+                                axial = force.data[0, i, 6] if len(force.data.shape) == 3 else force.data[i, 6]
+                                pid = self.elem_to_prop.get(int(eid))
+                                d1 = d2 = area = stress = None
 
+                                # Get dimensions from bar_properties (loaded from Excel)
+                                if pid and pid in self.bar_properties:
+                                    d1 = self.current_bar_thicknesses.get(pid, self.bar_properties[pid].get('dim1', 0))
+                                    d2 = self.bar_properties[pid].get('dim2', d1)
+                                    area = d1 * d2
+                                    if area > 0:
+                                        stress = axial / area
+
+                                results.append({
+                                    'eid': int(eid), 'type': 'bar',
+                                    'stress': float(stress) if stress else 0,
+                                    'subcase': int(sc_id)
+                                })
+
+                                bar_stress_rows.append({
+                                    'OP2': op2_name, 'Subcase': int(sc_id), 'Element': int(eid),
+                                    'Property': pid, 'Axial': float(axial) if axial else 0,
+                                    'Dim1': d1, 'Dim2': d2, 'Area': area,
+                                    'Stress': float(stress) if stress else None
+                                })
+
+                    # SHELL STRESS from cquad4_stress
                     if hasattr(op2, 'cquad4_stress') and op2.cquad4_stress:
                         for sc_id, data in op2.cquad4_stress.items():
                             for i, eid in enumerate(data.element):
                                 stress = data.data[0, i, -1] if len(data.data.shape) == 3 else data.data[i, -1]
-                                results.append({'eid': int(eid), 'type': 'shell', 'stress': float(stress)})
-                except:
-                    pass
+                                results.append({
+                                    'eid': int(eid), 'type': 'shell',
+                                    'stress': float(stress),
+                                    'subcase': int(sc_id)
+                                })
+                except Exception as e:
+                    self.log(f"    OP2 read error: {e}")
+
+        # Save bar_stress_results.csv
+        if bar_stress_rows:
+            csv_path = os.path.join(folder, 'bar_stress_results.csv')
+            with open(csv_path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=['OP2', 'Subcase', 'Element', 'Property', 'Axial', 'Dim1', 'Dim2', 'Area', 'Stress'])
+                w.writeheader()
+                w.writerows(bar_stress_rows)
+            self.log(f"    Saved: bar_stress_results.csv ({len(bar_stress_rows)} rows)")
+
         return results
 
-    def _calculate_rf(self, stresses, target_rf):
+    def _combine_stresses(self, folder):
+        """Combine stresses using Residual Strength table (RF Check Tool logic)."""
+        if self.residual_strength_df is None or len(self.combination_table) == 0:
+            self.log("    No Residual Strength data - skipping combination")
+            return None
+
+        stress_csv = os.path.join(folder, 'bar_stress_results.csv')
+        if not os.path.exists(stress_csv):
+            self.log("    bar_stress_results.csv not found")
+            return None
+
+        try:
+            stress_df = pd.read_csv(stress_csv)
+
+            # Build lookup: (subcase, element) -> stress
+            lookup = {}
+            for _, row in stress_df.iterrows():
+                key = (int(row['Subcase']), int(row['Element']))
+                lookup[key] = row['Stress'] if pd.notna(row['Stress']) else 0
+
+            elements = stress_df['Element'].unique()
+
+            rs_df = self.residual_strength_df
+            cols = rs_df.columns.tolist()
+            comb_col = cols[0]  # First column is Combined LC
+
+            results = []
+            for _, rs_row in rs_df.iterrows():
+                comb_lc = rs_row[comb_col]
+                if pd.isna(comb_lc):
+                    continue
+                comb_lc = int(comb_lc)
+
+                for eid in elements:
+                    total_stress = 0.0
+                    components = []
+
+                    for case_col, mult_col in self.combination_table:
+                        case_id = rs_row[case_col]
+                        multiplier = rs_row[mult_col]
+                        if pd.isna(case_id) or pd.isna(multiplier):
+                            continue
+                        case_id = int(case_id)
+                        multiplier = float(multiplier)
+
+                        key = (case_id, int(eid))
+                        if key in lookup:
+                            stress = lookup[key]
+                            if stress is not None:
+                                total_stress += stress * multiplier
+                                components.append(f"{case_id}*{multiplier}")
+
+                    if components:
+                        results.append({
+                            'Combined_LC': comb_lc, 'Element': int(eid),
+                            'Combined_Stress': total_stress,
+                            'Components': ' + '.join(components)
+                        })
+
+            # Save combined_stress_results.csv
+            if results:
+                comb_csv = os.path.join(folder, 'combined_stress_results.csv')
+                with open(comb_csv, 'w', newline='') as f:
+                    w = csv.DictWriter(f, fieldnames=['Combined_LC', 'Element', 'Combined_Stress', 'Components'])
+                    w.writeheader()
+                    w.writerows(results)
+                self.log(f"    Saved: combined_stress_results.csv ({len(results)} rows)")
+                return results
+
+        except Exception as e:
+            self.log(f"    Combine error: {e}")
+
+        return None
+
+    def _calculate_rf(self, stresses, target_rf, combined_stresses=None):
+        """Calculate RF using combined stresses if available, otherwise raw stresses."""
         details = []
         failing_pids = set()
         elem_fit = prop_fit = 0
 
+        # If combined stresses are available, build lookup
+        combined_lookup = {}
+        if combined_stresses:
+            # Find max combined stress per element (critical case)
+            for cs in combined_stresses:
+                eid = cs['Element']
+                comb_stress = abs(cs['Combined_Stress'])
+                if eid not in combined_lookup or comb_stress > combined_lookup[eid]:
+                    combined_lookup[eid] = comb_stress
+
         for s in stresses:
             eid = s['eid']
-            stress = abs(s['stress'])
             etype = s['type']
             pid = self.elem_to_prop.get(eid)
+
+            # Use combined stress if available, otherwise use raw stress
+            if eid in combined_lookup and etype == 'bar':
+                stress = combined_lookup[eid]
+                stress_src = 'combined'
+            else:
+                stress = abs(s['stress'])
+                stress_src = 'raw'
 
             if etype == 'bar' and pid:
                 t = self.current_bar_thicknesses.get(pid, float(self.bar_min_thickness.get()))
@@ -1831,7 +2047,8 @@ class ThicknessIterationTool:
             details.append({
                 'eid': eid, 'pid': pid, 'type': etype, 'thickness': t,
                 'stress': stress, 'allowable': allowable, 'rf': rf,
-                'status': status, 'fit_src': fit_src, 'req_thickness': req_t
+                'status': status, 'fit_src': fit_src, 'req_thickness': req_t,
+                'stress_src': stress_src
             })
 
         valid_rf = [d['rf'] for d in details if 0 < d['rf'] < 999]
