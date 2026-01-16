@@ -1022,6 +1022,7 @@ class ThicknessIterationTool:
                 self._update_ui()
 
             self._save_results(base_folder)
+            self._generate_final_report(base_folder, "Simple Iterative", nastran_count=iteration)
 
             self.root.after(0, lambda: messagebox.showinfo("Done", f"Complete!\nIterations: {iteration}\nBest weight: {best_weight:.6f}t"))
 
@@ -1183,6 +1184,8 @@ class ThicknessIterationTool:
                 base_folder = os.path.join(self.output_folder.get(), f"fast_ga_{timestamp}")
                 os.makedirs(base_folder, exist_ok=True)
                 self._save_results(base_folder)
+                self._generate_final_report(base_folder, "Fast GA (Surrogate)",
+                    extra_info={"Note": "Results based on surrogate model - run Nastran to verify"})
 
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Fast GA Complete",
@@ -1386,6 +1389,8 @@ class ThicknessIterationTool:
 
                 self._update_ui()
                 self._save_results(base_folder)
+                self._generate_final_report(base_folder, "Hybrid GA + Nastran", nastran_count=1,
+                    extra_info={"Phase 1": "Fast GA (Surrogate)", "Phase 2": "Nastran Validation"})
 
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Hybrid GA Complete",
@@ -1591,6 +1596,8 @@ class ThicknessIterationTool:
 
                 self._update_ui()
                 self._save_results(base_folder)
+                self._generate_final_report(base_folder, "Full GA + Nastran", nastran_count=eval_count,
+                    extra_info={"Population": pop_size, "Generations": n_generations})
 
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Full GA Complete",
@@ -1950,6 +1957,14 @@ class ThicknessIterationTool:
                     surrogate_data.append(row)
                 pd.DataFrame(surrogate_data).to_csv(os.path.join(base_folder, "surrogate_data.csv"), index=False)
                 self.log(f"\nSurrogate training data saved to surrogate_data.csv")
+
+                self._generate_final_report(base_folder, "Surrogate-Assisted GA", nastran_count=nastran_count,
+                    extra_info={
+                        "Initial Samples": initial_samples,
+                        "Nastran per Generation": nastran_per_gen,
+                        "Surrogate Model Size": len(X_train),
+                        "Savings vs Full GA": f"{(1 - nastran_count/(pop_size*n_generations))*100:.1f}%"
+                    })
 
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Surrogate-Assisted GA Complete",
@@ -2804,6 +2819,183 @@ class ThicknessIterationTool:
 
         except Exception as e:
             self.log(f"Save error: {e}")
+
+    def _generate_final_report(self, folder, algorithm_name, nastran_count=None, extra_info=None):
+        """Generate comprehensive final optimization report."""
+        if not self.best_solution:
+            self.log("No best solution found - cannot generate report")
+            return
+
+        report_lines = []
+        sep = "═" * 70
+
+        # Header
+        report_lines.append("")
+        report_lines.append(sep)
+        report_lines.append("              OPTIMIZATION FINAL REPORT")
+        report_lines.append(sep)
+        report_lines.append(f"  Algorithm: {algorithm_name}")
+        report_lines.append(f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(sep)
+
+        # Best Solution Summary
+        report_lines.append("")
+        report_lines.append("  BEST SOLUTION FOUND:")
+        report_lines.append("  " + "-" * 40)
+        report_lines.append(f"    Iteration/Evaluation: {self.best_solution['iteration']}")
+        report_lines.append(f"    Minimum RF: {self.best_solution['min_rf']:.4f}")
+        report_lines.append(f"    Total Weight: {self.best_solution['weight']:.6f} tonnes")
+        report_lines.append(f"    Failed Elements: {self.best_solution['n_fail']}")
+
+        target_rf = float(self.target_rf.get())
+        if self.best_solution['min_rf'] >= target_rf:
+            report_lines.append(f"    Status: ✓ CONVERGED (RF >= {target_rf})")
+        else:
+            report_lines.append(f"    Status: ✗ NOT CONVERGED (RF < {target_rf})")
+
+        # Bar Thickness Changes
+        bar_min = float(self.bar_min_thickness.get())
+        report_lines.append("")
+        report_lines.append("  BAR THICKNESS RESULTS:")
+        report_lines.append("  " + "-" * 40)
+        report_lines.append(f"    {'PID':<10} {'Initial':>10} {'Final':>10} {'Change':>12}")
+        report_lines.append("    " + "-" * 44)
+
+        bar_thicknesses = self.best_solution.get('bar_thicknesses', {})
+        total_bar_increase = 0
+        for pid in sorted(bar_thicknesses.keys()):
+            final_t = bar_thicknesses[pid]
+            initial_t = bar_min
+            change_pct = ((final_t - initial_t) / initial_t * 100) if initial_t > 0 else 0
+            total_bar_increase += (final_t - initial_t)
+            report_lines.append(f"    {pid:<10} {initial_t:>10.2f} {final_t:>10.2f} {change_pct:>+10.1f}%")
+
+        if bar_thicknesses:
+            avg_bar = sum(bar_thicknesses.values()) / len(bar_thicknesses)
+            report_lines.append("    " + "-" * 44)
+            report_lines.append(f"    {'Average':<10} {bar_min:>10.2f} {avg_bar:>10.2f}")
+
+        # Skin Thickness Changes
+        skin_min = float(self.skin_min_thickness.get())
+        skin_thicknesses = self.best_solution.get('skin_thicknesses', {})
+        if skin_thicknesses:
+            report_lines.append("")
+            report_lines.append("  SKIN THICKNESS RESULTS:")
+            report_lines.append("  " + "-" * 40)
+            report_lines.append(f"    {'PID':<10} {'Initial':>10} {'Final':>10} {'Change':>12}")
+            report_lines.append("    " + "-" * 44)
+
+            for pid in sorted(skin_thicknesses.keys()):
+                final_t = skin_thicknesses[pid]
+                initial_t = skin_min
+                change_pct = ((final_t - initial_t) / initial_t * 100) if initial_t > 0 else 0
+                report_lines.append(f"    {pid:<10} {initial_t:>10.2f} {final_t:>10.2f} {change_pct:>+10.1f}%")
+
+            avg_skin = sum(skin_thicknesses.values()) / len(skin_thicknesses)
+            report_lines.append("    " + "-" * 44)
+            report_lines.append(f"    {'Average':<10} {skin_min:>10.2f} {avg_skin:>10.2f}")
+
+        # RF Statistics
+        rf_details = self.best_solution.get('rf_details', [])
+        if rf_details:
+            valid_rfs = [d['rf'] for d in rf_details if d['rf'] is not None and 0 < d['rf'] < 999]
+            if valid_rfs:
+                report_lines.append("")
+                report_lines.append("  RF STATISTICS:")
+                report_lines.append("  " + "-" * 40)
+                report_lines.append(f"    Minimum RF: {min(valid_rfs):.4f}")
+                report_lines.append(f"    Maximum RF: {max(valid_rfs):.4f}")
+                report_lines.append(f"    Average RF: {sum(valid_rfs)/len(valid_rfs):.4f}")
+                report_lines.append(f"    Total Elements Analyzed: {len(rf_details)}")
+
+                # RF Distribution
+                below_target = sum(1 for rf in valid_rfs if rf < target_rf)
+                near_target = sum(1 for rf in valid_rfs if target_rf <= rf < target_rf + 0.2)
+                above_target = sum(1 for rf in valid_rfs if rf >= target_rf + 0.2)
+
+                report_lines.append("")
+                report_lines.append(f"    RF Distribution:")
+                report_lines.append(f"      Below target (RF < {target_rf}): {below_target} elements")
+                report_lines.append(f"      Near target ({target_rf} ≤ RF < {target_rf+0.2}): {near_target} elements")
+                report_lines.append(f"      Above target (RF ≥ {target_rf+0.2}): {above_target} elements")
+
+                # Critical elements (lowest RF)
+                report_lines.append("")
+                report_lines.append("    Critical Elements (Lowest RF):")
+                sorted_details = sorted([d for d in rf_details if d['rf'] and 0 < d['rf'] < 999],
+                                       key=lambda x: x['rf'])[:5]
+                for d in sorted_details:
+                    report_lines.append(f"      EID {d['eid']}: RF={d['rf']:.4f}, PID={d['pid']}, Stress={d['stress']:.2f}")
+
+        # Convergence Info
+        report_lines.append("")
+        report_lines.append("  CONVERGENCE INFO:")
+        report_lines.append("  " + "-" * 40)
+
+        if nastran_count:
+            report_lines.append(f"    Total Nastran Evaluations: {nastran_count}")
+
+        if self.iteration_results:
+            first_result = self.iteration_results[0]
+            report_lines.append(f"    Initial Min RF: {first_result['min_rf']:.4f}")
+            report_lines.append(f"    Final Min RF: {self.best_solution['min_rf']:.4f}")
+            rf_improvement = self.best_solution['min_rf'] - first_result['min_rf']
+            report_lines.append(f"    RF Improvement: {rf_improvement:+.4f}")
+
+            report_lines.append(f"    Initial Weight: {first_result['weight']:.6f} t")
+            report_lines.append(f"    Final Weight: {self.best_solution['weight']:.6f} t")
+            weight_change = ((self.best_solution['weight'] - first_result['weight']) / first_result['weight'] * 100) if first_result['weight'] > 0 else 0
+            report_lines.append(f"    Weight Change: {weight_change:+.1f}%")
+
+        # Extra algorithm-specific info
+        if extra_info:
+            report_lines.append("")
+            report_lines.append("  ALGORITHM SPECIFIC:")
+            report_lines.append("  " + "-" * 40)
+            for key, value in extra_info.items():
+                report_lines.append(f"    {key}: {value}")
+
+        # Footer
+        report_lines.append("")
+        report_lines.append(sep)
+        report_lines.append(f"  Report saved to: {folder}")
+        report_lines.append(sep)
+        report_lines.append("")
+
+        # Join and display
+        report_text = "\n".join(report_lines)
+        self.log(report_text)
+
+        # Save to file
+        try:
+            report_path = os.path.join(folder, "FINAL_REPORT.txt")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report_text)
+            self.log(f"Report saved to: {report_path}")
+
+            # Also save detailed thickness CSV
+            thickness_data = []
+            for pid, t in bar_thicknesses.items():
+                thickness_data.append({
+                    'Type': 'BAR',
+                    'PID': pid,
+                    'Initial_mm': bar_min,
+                    'Final_mm': t,
+                    'Change_pct': ((t - bar_min) / bar_min * 100) if bar_min > 0 else 0
+                })
+            for pid, t in skin_thicknesses.items():
+                thickness_data.append({
+                    'Type': 'SKIN',
+                    'PID': pid,
+                    'Initial_mm': skin_min,
+                    'Final_mm': t,
+                    'Change_pct': ((t - skin_min) / skin_min * 100) if skin_min > 0 else 0
+                })
+            if thickness_data:
+                pd.DataFrame(thickness_data).to_csv(os.path.join(folder, "final_thicknesses.csv"), index=False)
+
+        except Exception as e:
+            self.log(f"Error saving report: {e}")
 
     def _update_ui(self):
         if self.best_solution:
