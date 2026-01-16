@@ -209,7 +209,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Hybrid GA + Nastran')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Hybrid GA + Nastran')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -932,6 +932,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_simple_iterative, daemon=True).start()
         elif algo == "Fast GA (Surrogate)":
             threading.Thread(target=self._run_fast_ga, daemon=True).start()
+        elif algo == "Full GA + Nastran":
+            threading.Thread(target=self._run_full_ga_nastran, daemon=True).start()
         elif algo == "Hybrid GA + Nastran":
             threading.Thread(target=self._run_hybrid_ga, daemon=True).start()
         else:
@@ -1399,6 +1401,211 @@ class ThicknessIterationTool:
             self.is_running = False
             self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
 
+    def _run_full_ga_nastran(self):
+        """Algorithm 4: Full GA with Nastran - runs Nastran for every fitness evaluation."""
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: FULL GA + NASTRAN")
+            self.log("(Runs Nastran for every fitness evaluation - SLOW but ACCURATE)")
+            self.log("="*70)
+
+            # Parameters
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+
+            pop_size = int(self.ga_population.get())
+            n_generations = int(self.ga_generations.get())
+            mutation_rate = float(self.ga_mutation_rate.get())
+            crossover_rate = float(self.ga_crossover_rate.get())
+
+            self.log(f"\nGA Parameters:")
+            self.log(f"  Population: {pop_size}")
+            self.log(f"  Generations: {n_generations}")
+            self.log(f"  Mutation Rate: {mutation_rate}")
+            self.log(f"  Crossover Rate: {crossover_rate}")
+            self.log(f"\nTarget RF: {target_rf} ± {rf_tol}")
+            self.log(f"\nWARNING: This will run {pop_size * n_generations} Nastran analyses!")
+
+            bar_pids = list(self.bar_properties.keys())
+            skin_pids = list(self.skin_properties.keys())
+            n_bars = len(bar_pids)
+            n_skins = len(skin_pids)
+            n_genes = n_bars + n_skins
+
+            if n_genes == 0:
+                self.log("ERROR: No properties to optimize!")
+                return
+
+            self.log(f"\nChromosome: {n_bars} bars + {n_skins} skins = {n_genes} genes")
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"full_ga_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # Initialize population
+            population = []
+            for _ in range(pop_size):
+                chromosome = []
+                for pid in bar_pids:
+                    chromosome.append(random.uniform(bar_min, bar_max))
+                for pid in skin_pids:
+                    chromosome.append(random.uniform(skin_min, skin_max))
+                population.append(chromosome)
+
+            best_fitness = float('-inf')
+            best_chromosome = None
+            best_result = None
+            eval_count = 0
+
+            for gen in range(n_generations):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*50}")
+                self.log(f"GENERATION {gen+1}/{n_generations}")
+                self.log(f"{'='*50}")
+
+                self.update_progress((gen/n_generations)*100, f"Gen {gen+1}/{n_generations}")
+
+                # Evaluate fitness for each individual using Nastran
+                fitness_scores = []
+                for idx, chromosome in enumerate(population):
+                    if not self.is_running:
+                        break
+
+                    eval_count += 1
+                    self.log(f"\n  Individual {idx+1}/{pop_size} (Eval #{eval_count})")
+
+                    # Set thicknesses from chromosome
+                    for i, pid in enumerate(bar_pids):
+                        self.current_bar_thicknesses[pid] = max(bar_min, min(bar_max, chromosome[i]))
+                    for i, pid in enumerate(skin_pids):
+                        self.current_skin_thicknesses[pid] = max(skin_min, min(skin_max, chromosome[n_bars + i]))
+
+                    # Run Nastran
+                    iter_folder = os.path.join(base_folder, f"gen_{gen+1:03d}_ind_{idx+1:03d}")
+                    os.makedirs(iter_folder, exist_ok=True)
+
+                    result = self._run_iteration(iter_folder, eval_count, target_rf)
+
+                    if result:
+                        min_rf = result['min_rf']
+                        weight = result['weight']
+
+                        # Fitness: minimize weight, penalize RF < target
+                        if min_rf >= target_rf - rf_tol:
+                            fitness = 1000.0 / (weight + 0.001)  # Higher is better
+                        else:
+                            # Penalty for failing RF
+                            penalty = (target_rf - min_rf) * 100
+                            fitness = 1000.0 / (weight + 0.001) - penalty
+
+                        fitness_scores.append(fitness)
+                        self.log(f"    RF={min_rf:.4f}, Weight={weight:.6f}t, Fitness={fitness:.2f}")
+
+                        # Track best
+                        if fitness > best_fitness:
+                            best_fitness = fitness
+                            best_chromosome = chromosome.copy()
+                            best_result = result
+                            self.best_solution = result
+                            self.log(f"    *** NEW BEST! ***")
+                    else:
+                        fitness_scores.append(-1000)  # Failed evaluation
+                        self.log(f"    FAILED!")
+
+                if not self.is_running or len(fitness_scores) < pop_size:
+                    break
+
+                # Selection (Tournament)
+                def tournament_select(pop, fit, k=3):
+                    selected = random.sample(list(zip(pop, fit)), k)
+                    return max(selected, key=lambda x: x[1])[0]
+
+                # Create new population
+                new_population = []
+
+                # Elitism - keep best individual
+                if best_chromosome:
+                    new_population.append(best_chromosome.copy())
+
+                while len(new_population) < pop_size:
+                    # Select parents
+                    parent1 = tournament_select(population, fitness_scores)
+                    parent2 = tournament_select(population, fitness_scores)
+
+                    # Crossover (BLX-α)
+                    if random.random() < crossover_rate:
+                        child = []
+                        alpha = 0.5
+                        for g1, g2 in zip(parent1, parent2):
+                            d = abs(g2 - g1)
+                            low = max(bar_min if len(child) < n_bars else skin_min, min(g1, g2) - alpha * d)
+                            high = min(bar_max if len(child) < n_bars else skin_max, max(g1, g2) + alpha * d)
+                            child.append(random.uniform(low, high))
+                    else:
+                        child = parent1.copy()
+
+                    # Mutation (Gaussian)
+                    for i in range(len(child)):
+                        if random.random() < mutation_rate:
+                            if i < n_bars:
+                                sigma = (bar_max - bar_min) * 0.1
+                                child[i] = max(bar_min, min(bar_max, child[i] + random.gauss(0, sigma)))
+                            else:
+                                sigma = (skin_max - skin_min) * 0.1
+                                child[i] = max(skin_min, min(skin_max, child[i] + random.gauss(0, sigma)))
+
+                    new_population.append(child)
+
+                population = new_population[:pop_size]
+
+                # Log generation summary
+                valid_fitness = [f for f in fitness_scores if f > -500]
+                if valid_fitness:
+                    self.log(f"\n  Gen {gen+1} Summary: Best Fitness={max(valid_fitness):.2f}, Avg={sum(valid_fitness)/len(valid_fitness):.2f}")
+
+            # Final results
+            self.log("\n" + "="*70)
+            self.log("FULL GA + NASTRAN COMPLETE")
+            self.log("="*70)
+            self.log(f"Total Nastran evaluations: {eval_count}")
+
+            if best_result:
+                # Set final thicknesses
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = best_chromosome[i]
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = best_chromosome[n_bars + i]
+
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {best_result['min_rf']:.4f}")
+                self.log(f"  Weight: {best_result['weight']:.6f}t")
+                self.log(f"  Failures: {best_result['n_fail']}")
+
+                self._update_ui()
+                self._save_results(base_folder)
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Full GA Complete",
+                    f"Optimization finished!\n\nTotal Evaluations: {eval_count}\nWeight: {best_result['weight']:.6f}t\nMin RF: {best_result['min_rf']:.4f}\nFailures: {best_result['n_fail']}"
+                ))
+            else:
+                self.log("ERROR: No valid solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
     def _run_fast_ga_internal(self):
         """Internal Fast GA without UI cleanup (for Hybrid)."""
         # Parameters
@@ -1506,11 +1713,23 @@ class ThicknessIterationTool:
             self.log("  [4] Extracting stresses...")
             stresses = self._extract_stresses(folder)
 
+            if not stresses:
+                self.log("  WARNING: No stress data extracted! Check if OP2 file exists.")
+                self.log(f"    Looking in: {folder}")
+                op2_files = [f for f in os.listdir(folder) if f.lower().endswith('.op2')]
+                self.log(f"    OP2 files found: {op2_files}")
+            else:
+                bar_stresses = [s for s in stresses if s['type'] == 'bar']
+                shell_stresses = [s for s in stresses if s['type'] == 'shell']
+                self.log(f"    Extracted: {len(bar_stresses)} bar, {len(shell_stresses)} shell stresses")
+
             # 4.5 Combine stresses using Residual Strength (if loaded)
             combined_stresses = None
             if self.residual_strength_df is not None:
                 self.log("  [4.5] Combining stresses...")
                 combined_stresses = self._combine_stresses(folder)
+                if combined_stresses:
+                    self.log(f"    Combined: {len(combined_stresses)} stress combinations")
 
             # 5. Calculate RF
             self.log("  [5] Calculating RF...")
@@ -2140,6 +2359,8 @@ class ThicknessIterationTool:
 
         if updated:
             self.log(f"  Updated {updated} properties")
+        else:
+            self.log(f"  No property updates needed (failing: {len(failing_pids)}, at max: {sum(1 for p in failing_pids if (p in self.current_bar_thicknesses and self.current_bar_thicknesses[p] >= bar_max) or (p in self.current_skin_thicknesses and self.current_skin_thicknesses[p] >= skin_max))})")
 
     def _save_iteration(self, folder, result):
         try:
