@@ -1230,17 +1230,20 @@ class ThicknessIterationTool:
         return min_rf
 
     def _blx_crossover(self, parent1, parent2, alpha=0.5):
-        """BLX-alpha crossover for real-valued chromosomes."""
+        """BLX-alpha crossover for real-valued chromosomes with bounds check."""
         child = []
         for g1, g2 in zip(parent1, parent2):
             min_g, max_g = min(g1, g2), max(g1, g2)
             range_g = max_g - min_g
-            child.append(random.uniform(min_g - alpha * range_g, max_g + alpha * range_g))
+            # Generate child gene
+            new_val = random.uniform(min_g - alpha * range_g, max_g + alpha * range_g)
+            # Ensure positive (will be bounded later in mutation)
+            child.append(max(0.1, new_val))  # Never negative!
         return child
 
     def _gaussian_mutation(self, chromosome, mutation_rate, n_bars,
                            bar_min, bar_max, skin_min, skin_max):
-        """Gaussian mutation with bounds."""
+        """Gaussian mutation with STRICT bounds enforcement."""
         mutated = chromosome.copy()
         for i in range(len(mutated)):
             if random.random() < mutation_rate:
@@ -1248,11 +1251,19 @@ class ThicknessIterationTool:
                     # Bar gene
                     sigma = (bar_max - bar_min) * 0.1
                     mutated[i] += random.gauss(0, sigma)
+                    # STRICT bounds - never negative!
                     mutated[i] = max(bar_min, min(bar_max, mutated[i]))
                 else:
                     # Skin gene
                     sigma = (skin_max - skin_min) * 0.1
                     mutated[i] += random.gauss(0, sigma)
+                    # STRICT bounds - never negative!
+                    mutated[i] = max(skin_min, min(skin_max, mutated[i]))
+            else:
+                # Even without mutation, enforce bounds (for crossover results)
+                if i < n_bars:
+                    mutated[i] = max(bar_min, min(bar_max, mutated[i]))
+                else:
                     mutated[i] = max(skin_min, min(skin_max, mutated[i]))
         return mutated
 
@@ -1453,6 +1464,7 @@ class ThicknessIterationTool:
             return None
 
     def _write_bdf(self, folder):
+        """Write BDF with updated thicknesses - dim1 updated, dim2 kept original."""
         input_bdf = self.input_bdf_path.get()
         output_bdf = os.path.join(folder, "model.bdf")
 
@@ -1469,18 +1481,36 @@ class ThicknessIterationTool:
                     pid = int(line[8:16].strip())
                     if pid in self.current_bar_thicknesses:
                         t = self.current_bar_thicknesses[pid]
+                        # Ensure thickness is positive
+                        t = max(0.1, t)
                         new_lines.append(line)
                         i += 1
-                        while i < len(lines) and (lines[i].startswith('+') or lines[i].startswith('*') or (lines[i].startswith(' ') and lines[i].strip())):
+                        # Process continuation lines
+                        while i < len(lines) and (lines[i].startswith('+') or lines[i].startswith('*') or (lines[i][0] == ' ' and lines[i].strip() and not lines[i].strip().startswith('$'))):
                             cont = lines[i]
                             if cont.strip() and not cont.strip().startswith('$'):
-                                new_cont = cont[:8] + f"{t:8.4f}" + f"{t:8.4f}" + (cont[24:] if len(cont) > 24 else '\n')
+                                # Parse original dim2 value (keep it)
+                                try:
+                                    # Original format: +name   DIM1    DIM2    ...
+                                    # Field positions: 0-8=cont name, 8-16=DIM1, 16-24=DIM2
+                                    original_dim2 = cont[16:24].strip()
+                                    if original_dim2:
+                                        dim2_val = float(original_dim2)
+                                    else:
+                                        dim2_val = t  # fallback
+                                except:
+                                    dim2_val = t  # fallback if parsing fails
+
+                                # Write: continuation + new DIM1 + original DIM2 + rest
+                                cont_name = cont[:8]
+                                rest = cont[24:] if len(cont) > 24 else '\n'
+                                new_cont = f"{cont_name}{t:8.4f}{dim2_val:8.4f}{rest}"
                                 new_lines.append(new_cont)
                             else:
                                 new_lines.append(cont)
                             i += 1
                         continue
-                except:
+                except Exception as e:
                     pass
 
             elif line.startswith('PSHELL'):
@@ -1488,6 +1518,10 @@ class ThicknessIterationTool:
                     pid = int(line[8:16].strip())
                     if pid in self.current_skin_thicknesses:
                         t = self.current_skin_thicknesses[pid]
+                        # Ensure thickness is positive
+                        t = max(0.1, t)
+                        # PSHELL format: PSHELL  PID     MID1    T       ...
+                        # Field: 0-8=PSHELL, 8-16=PID, 16-24=MID1, 24-32=T
                         new_line = line[:24] + f"{t:8.4f}" + line[32:]
                         new_lines.append(new_line)
                         i += 1
@@ -1501,16 +1535,21 @@ class ThicknessIterationTool:
         with open(output_bdf, 'w', encoding='latin-1') as f:
             f.writelines(new_lines)
 
+        self.log(f"    BDF written: {output_bdf}")
         return output_bdf
 
     def _apply_offsets(self, bdf_path, folder):
+        """Apply landing zoffset and bar WA/WB offsets to BDF."""
         if not self.landing_elem_ids and not self.bar_offset_elem_ids:
+            self.log("    No offset elements defined, skipping offset application")
             return bdf_path
 
         try:
+            self.log(f"    Loading BDF for offset calculation...")
             bdf = BDF(debug=False)
             bdf.read_bdf(bdf_path, validate=False, xref=True, read_includes=True, encoding='latin-1')
 
+            # Calculate landing (shell) offsets: zoffset = -t/2
             landing_offsets = {}
             landing_normals = {}
 
@@ -1519,23 +1558,30 @@ class ThicknessIterationTool:
                     continue
                 elem = bdf.elements[eid]
                 pid = elem.pid if hasattr(elem, 'pid') else None
+                if pid is None:
+                    continue
+
                 t = self.current_skin_thicknesses.get(pid, float(self.skin_min_thickness.get()))
+                t = max(0.1, t)  # Ensure positive
                 landing_offsets[eid] = -t / 2.0
 
+                # Calculate normal vector for bar offset calculation
                 if elem.type in ['CQUAD4', 'CTRIA3']:
                     try:
                         nids = elem.node_ids[:3]
                         nodes = [bdf.nodes[n] for n in nids if n in bdf.nodes]
                         if len(nodes) >= 3:
                             p1, p2, p3 = [np.array(n.get_position()) for n in nodes]
-                            normal = np.cross(p2-p1, p3-p1)
+                            normal = np.cross(p2 - p1, p3 - p1)
                             nl = np.linalg.norm(normal)
                             if nl > 1e-10:
                                 landing_normals[eid] = normal / nl
                     except:
                         pass
 
-            # Bar offsets
+            self.log(f"    Landing offsets calculated: {len(landing_offsets)} elements")
+
+            # Build node -> shell mapping for bar offset calculation
             node_to_shells = {}
             for eid, elem in bdf.elements.items():
                 if elem.type in ['CQUAD4', 'CTRIA3']:
@@ -1544,69 +1590,114 @@ class ThicknessIterationTool:
                             node_to_shells[nid] = []
                         node_to_shells[nid].append(eid)
 
+            # Calculate bar offsets: WA = WB = -normal * (landing_t + bar_t/2)
             bar_offsets = {}
             for eid in self.bar_offset_elem_ids:
                 if eid not in bdf.elements:
                     continue
                 elem = bdf.elements[eid]
-                if elem.type != 'CBAR':
+                if elem.type not in ['CBAR', 'CBEAM']:
                     continue
 
                 pid = elem.pid if hasattr(elem, 'pid') else None
+                if pid is None:
+                    continue
+
                 bar_t = self.current_bar_thicknesses.get(pid, float(self.bar_min_thickness.get()))
+                bar_t = max(0.1, bar_t)  # Ensure positive
 
                 bar_nodes = elem.node_ids[:2]
                 if bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
                     max_t = 0
                     best_normal = None
+
                     for shell_eid in common:
                         if shell_eid in landing_offsets:
-                            shell_pid = bdf.elements[shell_eid].pid
-                            shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
-                            if shell_t > max_t:
-                                max_t = shell_t
-                                if shell_eid in landing_normals:
-                                    best_normal = landing_normals[shell_eid]
+                            shell_elem = bdf.elements[shell_eid]
+                            shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
+                            if shell_pid:
+                                shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
+                                if shell_t > max_t:
+                                    max_t = shell_t
+                                    if shell_eid in landing_normals:
+                                        best_normal = landing_normals[shell_eid]
 
                     if best_normal is not None and max_t > 0:
+                        # Offset = landing_thickness + bar_thickness/2
                         offset_mag = max_t + bar_t / 2.0
                         bar_offsets[eid] = tuple(-best_normal * offset_mag)
 
-            # Apply to BDF
+            self.log(f"    Bar offsets calculated: {len(bar_offsets)} elements")
+
+            # Apply offsets to BDF file
             with open(bdf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
 
             def fmt(v, w=8):
+                """Format value for Nastran field."""
                 s = f"{v:.4f}"
                 return s[:w].ljust(w) if len(s) <= w else f"{v:.2E}"[:w].ljust(w)
 
             new_lines = []
             i = 0
+            applied_landing = 0
+            applied_bar = 0
+
             while i < len(lines):
                 line = lines[i]
 
+                # CQUAD4: Apply zoffset at field 9 (position 64-72)
                 if line.startswith('CQUAD4'):
                     try:
                         eid = int(line[8:16].strip())
                         if eid in landing_offsets:
-                            new_line = line[:64] + fmt(landing_offsets[eid]) + (line[72:] if len(line) > 72 else '\n')
+                            # Ensure line is long enough
+                            padded = line.rstrip().ljust(72)
+                            new_line = padded[:64] + fmt(landing_offsets[eid]) + '\n'
                             new_lines.append(new_line)
+                            applied_landing += 1
                             i += 1
                             continue
                     except:
                         pass
 
+                # CTRIA3: Apply zoffset at field 7 (position 48-56)
+                elif line.startswith('CTRIA3'):
+                    try:
+                        eid = int(line[8:16].strip())
+                        if eid in landing_offsets:
+                            padded = line.rstrip().ljust(56)
+                            new_line = padded[:48] + fmt(landing_offsets[eid]) + '\n'
+                            new_lines.append(new_line)
+                            applied_landing += 1
+                            i += 1
+                            continue
+                    except:
+                        pass
+
+                # CBAR: Apply WA, WB offset vectors as continuation
                 elif line.startswith('CBAR'):
                     try:
                         eid = int(line[8:16].strip())
                         if eid in bar_offsets:
                             vec = bar_offsets[eid]
-                            new_lines.append(line.rstrip() + '+CB' + str(eid)[-4:] + '\n')
-                            cont = ('+CB' + str(eid)[-4:]).ljust(8) + '        ' + '        '
-                            cont += fmt(vec[0]) + fmt(vec[1]) + fmt(vec[2])
-                            cont += fmt(vec[0]) + fmt(vec[1]) + fmt(vec[2]) + '\n'
-                            new_lines.append(cont)
+                            # Add continuation marker to main line
+                            cont_name = '+' + str(eid)[-7:]
+                            main_line = line.rstrip()
+                            if len(main_line) < 72:
+                                main_line = main_line.ljust(72)
+                            main_line = main_line[:72] + cont_name + '\n'
+                            new_lines.append(main_line)
+
+                            # Continuation line: WA(3) and WB(3)
+                            cont_line = cont_name.ljust(8)
+                            cont_line += fmt(vec[0]) + fmt(vec[1]) + fmt(vec[2])  # WA
+                            cont_line += fmt(vec[0]) + fmt(vec[1]) + fmt(vec[2])  # WB (same as WA)
+                            cont_line += '\n'
+                            new_lines.append(cont_line)
+
+                            applied_bar += 1
                             i += 1
                             continue
                     except:
@@ -1618,6 +1709,9 @@ class ThicknessIterationTool:
             output_bdf = os.path.join(folder, "model_offset.bdf")
             with open(output_bdf, 'w', encoding='latin-1') as f:
                 f.writelines(new_lines)
+
+            self.log(f"    Offsets applied: {applied_landing} landing, {applied_bar} bar")
+            self.log(f"    Offset BDF written: {output_bdf}")
 
             return output_bdf
 
