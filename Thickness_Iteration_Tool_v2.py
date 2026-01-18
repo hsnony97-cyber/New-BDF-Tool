@@ -28,6 +28,8 @@ import subprocess
 from datetime import datetime
 import random
 import copy
+from scipy.optimize import minimize
+from itertools import combinations
 
 
 class ThicknessIterationTool:
@@ -209,7 +211,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'Hybrid GA + Nastran')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -936,6 +938,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_full_ga_nastran, daemon=True).start()
         elif algo == "Surrogate-Assisted GA":
             threading.Thread(target=self._run_surrogate_assisted_ga, daemon=True).start()
+        elif algo == "RSM + SQP":
+            threading.Thread(target=self._run_rsm_sqp, daemon=True).start()
         elif algo == "Hybrid GA + Nastran":
             threading.Thread(target=self._run_hybrid_ga, daemon=True).start()
         else:
@@ -2032,6 +2036,418 @@ class ThicknessIterationTool:
         confidence = 1.0 / (1.0 + avg_dist * 10)  # Higher distance = lower confidence
 
         return pred_rf, pred_wt, confidence
+
+    def _run_rsm_sqp(self):
+        """Algorithm 6: RSM + SQP - Response Surface Methodology with Sequential Quadratic Programming."""
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: RSM + SQP")
+            self.log("(Response Surface Methodology + Sequential Quadratic Programming)")
+            self.log("="*70)
+
+            # Parameters
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            max_iter = int(self.max_iterations.get())
+
+            bar_pids = list(self.bar_properties.keys())
+            skin_pids = list(self.skin_properties.keys())
+            n_bars = len(bar_pids)
+            n_skins = len(skin_pids)
+            n_vars = n_bars + n_skins
+
+            if n_vars == 0:
+                self.log("ERROR: No properties to optimize!")
+                return
+
+            self.log(f"\nVariables: {n_bars} bars + {n_skins} skins = {n_vars} total")
+            self.log(f"Target RF: {target_rf}")
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"rsm_sqp_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # Bounds for each variable
+            bounds_low = [bar_min] * n_bars + [skin_min] * n_skins
+            bounds_high = [bar_max] * n_bars + [skin_max] * n_skins
+
+            # ========== PHASE 1: DOE - Latin Hypercube Sampling ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: Design of Experiments (Latin Hypercube)")
+            self.log("="*50)
+
+            # Number of initial samples: rule of thumb is (n+1)(n+2)/2 for quadratic model
+            # But we'll use a practical number
+            n_samples = min(max(2 * n_vars + 1, 15), 30)
+            self.log(f"Generating {n_samples} DOE samples...")
+
+            # Latin Hypercube Sampling
+            doe_samples = self._latin_hypercube_sampling(n_samples, n_vars, bounds_low, bounds_high)
+
+            # Evaluate DOE samples with Nastran
+            X_data = []  # Design points
+            y_rf_data = []  # RF responses
+            y_weight_data = []  # Weight responses
+            nastran_count = 0
+
+            best_result = None
+            best_fitness = float('-inf')
+
+            for idx, sample in enumerate(doe_samples):
+                if not self.is_running:
+                    break
+
+                nastran_count += 1
+                self.log(f"\n  DOE Sample {idx+1}/{n_samples} (Nastran #{nastran_count})")
+                self.update_progress((idx/n_samples)*30, f"DOE {idx+1}/{n_samples}")
+
+                # Set thicknesses
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = sample[i]
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = sample[n_bars + i]
+
+                # Run Nastran
+                iter_folder = os.path.join(base_folder, f"doe_{idx+1:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+                result = self._run_iteration(iter_folder, nastran_count, target_rf)
+
+                if result:
+                    X_data.append(sample)
+                    y_rf_data.append(result['min_rf'])
+                    y_weight_data.append(result['weight'])
+
+                    self.log(f"    RF={result['min_rf']:.4f}, Weight={result['weight']:.6f}t")
+
+                    # Track best feasible solution
+                    if result['min_rf'] >= target_rf - rf_tol:
+                        fitness = 1000.0 / (result['weight'] + 0.001)
+                        if fitness > best_fitness:
+                            best_fitness = fitness
+                            best_result = result
+                            self.best_solution = result
+                            self.log(f"    *** FEASIBLE SOLUTION ***")
+
+            if len(X_data) < n_vars + 1:
+                self.log("ERROR: Not enough valid DOE samples!")
+                return
+
+            X_data = np.array(X_data)
+            y_rf_data = np.array(y_rf_data)
+            y_weight_data = np.array(y_weight_data)
+
+            self.log(f"\n  DOE Complete: {len(X_data)} valid samples")
+
+            # ========== PHASE 2: Fit RSM Models ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: Fitting Response Surface Models")
+            self.log("="*50)
+
+            # Fit quadratic RSM for RF and Weight
+            rsm_rf = self._fit_rsm(X_data, y_rf_data, bounds_low, bounds_high)
+            rsm_weight = self._fit_rsm(X_data, y_weight_data, bounds_low, bounds_high)
+
+            if rsm_rf is None or rsm_weight is None:
+                self.log("ERROR: RSM fitting failed!")
+                return
+
+            self.log(f"  RF Model R²: {rsm_rf['r2']:.4f}")
+            self.log(f"  Weight Model R²: {rsm_weight['r2']:.4f}")
+
+            # ========== PHASE 3: SQP Optimization Loop ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 3: SQP Optimization with Trust Region")
+            self.log("="*50)
+
+            # Start from best DOE point or center
+            if best_result:
+                x0 = list(best_result['bar_thicknesses'].values()) + list(best_result.get('skin_thicknesses', {}).values())
+                if len(x0) != n_vars:
+                    x0 = [(l + h) / 2 for l, h in zip(bounds_low, bounds_high)]
+            else:
+                x0 = [(l + h) / 2 for l, h in zip(bounds_low, bounds_high)]
+
+            trust_radius = 1.0  # Normalized trust region radius
+            min_trust_radius = 0.1
+            sqp_iterations = 0
+            max_sqp_iterations = max_iter
+
+            while sqp_iterations < max_sqp_iterations and self.is_running:
+                sqp_iterations += 1
+                self.log(f"\n  SQP Iteration {sqp_iterations}")
+                self.update_progress(30 + (sqp_iterations/max_sqp_iterations)*60, f"SQP Iter {sqp_iterations}")
+
+                # Define objective: minimize weight subject to RF >= target
+                def objective(x):
+                    return self._rsm_predict(x, rsm_weight, bounds_low, bounds_high)
+
+                def rf_constraint(x):
+                    return self._rsm_predict(x, rsm_rf, bounds_low, bounds_high) - target_rf
+
+                # Bounds with trust region
+                tr_bounds = []
+                for i in range(n_vars):
+                    x_norm = (x0[i] - bounds_low[i]) / (bounds_high[i] - bounds_low[i])
+                    range_i = bounds_high[i] - bounds_low[i]
+                    tr_low = max(bounds_low[i], x0[i] - trust_radius * range_i)
+                    tr_high = min(bounds_high[i], x0[i] + trust_radius * range_i)
+                    tr_bounds.append((tr_low, tr_high))
+
+                # SQP optimization
+                constraints = {'type': 'ineq', 'fun': rf_constraint}
+
+                try:
+                    result_sqp = minimize(
+                        objective, x0,
+                        method='SLSQP',
+                        bounds=tr_bounds,
+                        constraints=constraints,
+                        options={'maxiter': 100, 'ftol': 1e-6}
+                    )
+                    x_opt = result_sqp.x
+                    pred_weight = result_sqp.fun
+                    pred_rf = self._rsm_predict(x_opt, rsm_rf, bounds_low, bounds_high)
+
+                    self.log(f"    SQP Result: Pred RF={pred_rf:.4f}, Pred Weight={pred_weight:.6f}")
+
+                except Exception as e:
+                    self.log(f"    SQP failed: {e}")
+                    break
+
+                # Validate with Nastran
+                nastran_count += 1
+                self.log(f"    Validating with Nastran #{nastran_count}...")
+
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = float(x_opt[i])
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = float(x_opt[n_bars + i])
+
+                iter_folder = os.path.join(base_folder, f"sqp_{sqp_iterations:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+                result = self._run_iteration(iter_folder, nastran_count, target_rf)
+
+                if result:
+                    actual_rf = result['min_rf']
+                    actual_weight = result['weight']
+
+                    self.log(f"    Actual: RF={actual_rf:.4f}, Weight={actual_weight:.6f}t")
+
+                    # Calculate prediction error
+                    rf_error = abs(pred_rf - actual_rf) / max(actual_rf, 0.001)
+                    weight_error = abs(pred_weight - actual_weight) / max(actual_weight, 0.001)
+
+                    self.log(f"    Errors: RF={rf_error*100:.1f}%, Weight={weight_error*100:.1f}%")
+
+                    # Update training data
+                    X_data = np.vstack([X_data, x_opt])
+                    y_rf_data = np.append(y_rf_data, actual_rf)
+                    y_weight_data = np.append(y_weight_data, actual_weight)
+
+                    # Check if solution is feasible
+                    if actual_rf >= target_rf - rf_tol:
+                        fitness = 1000.0 / (actual_weight + 0.001)
+                        if fitness > best_fitness:
+                            best_fitness = fitness
+                            best_result = result
+                            self.best_solution = result
+                            self.log(f"    *** NEW BEST! ***")
+
+                    # Trust region update
+                    if rf_error < 0.1 and weight_error < 0.1:
+                        # Good prediction, expand trust region
+                        trust_radius = min(trust_radius * 1.5, 1.0)
+                        x0 = list(x_opt)
+                        self.log(f"    Trust region expanded: {trust_radius:.2f}")
+                    elif rf_error > 0.3 or weight_error > 0.3:
+                        # Poor prediction, shrink trust region and refit RSM
+                        trust_radius = max(trust_radius * 0.5, min_trust_radius)
+                        self.log(f"    Trust region shrunk: {trust_radius:.2f}")
+
+                        # Refit RSM with new data
+                        rsm_rf = self._fit_rsm(X_data, y_rf_data, bounds_low, bounds_high)
+                        rsm_weight = self._fit_rsm(X_data, y_weight_data, bounds_low, bounds_high)
+                        self.log(f"    RSM refitted: RF R²={rsm_rf['r2']:.4f}, Weight R²={rsm_weight['r2']:.4f}")
+                    else:
+                        # Acceptable prediction
+                        x0 = list(x_opt)
+                        # Refit RSM periodically
+                        if sqp_iterations % 3 == 0:
+                            rsm_rf = self._fit_rsm(X_data, y_rf_data, bounds_low, bounds_high)
+                            rsm_weight = self._fit_rsm(X_data, y_weight_data, bounds_low, bounds_high)
+
+                    # Check convergence
+                    if trust_radius <= min_trust_radius and rf_error < 0.05:
+                        self.log(f"\n  CONVERGED at iteration {sqp_iterations}")
+                        break
+
+                else:
+                    self.log(f"    Nastran failed!")
+                    trust_radius = max(trust_radius * 0.5, min_trust_radius)
+
+            # ========== Final Results ==========
+            self.log("\n" + "="*70)
+            self.log("RSM + SQP OPTIMIZATION COMPLETE")
+            self.log("="*70)
+            self.log(f"Total Nastran evaluations: {nastran_count}")
+            self.log(f"DOE samples: {n_samples}")
+            self.log(f"SQP iterations: {sqp_iterations}")
+
+            if best_result:
+                for i, pid in enumerate(bar_pids):
+                    self.current_bar_thicknesses[pid] = best_result['bar_thicknesses'].get(pid, bar_min)
+                for i, pid in enumerate(skin_pids):
+                    self.current_skin_thicknesses[pid] = best_result.get('skin_thicknesses', {}).get(pid, skin_min)
+
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {best_result['min_rf']:.4f}")
+                self.log(f"  Weight: {best_result['weight']:.6f}t")
+                self.log(f"  Failures: {best_result['n_fail']}")
+
+                self._update_ui()
+                self._save_results(base_folder)
+                self._generate_final_report(base_folder, "RSM + SQP", nastran_count=nastran_count,
+                    extra_info={
+                        "DOE Samples": n_samples,
+                        "SQP Iterations": sqp_iterations,
+                        "Final RF Model R²": f"{rsm_rf['r2']:.4f}",
+                        "Final Weight Model R²": f"{rsm_weight['r2']:.4f}",
+                        "RSM Model Size": len(X_data)
+                    })
+
+                # Save RSM data
+                rsm_data = []
+                for i in range(len(X_data)):
+                    row = {'RF': y_rf_data[i], 'Weight': y_weight_data[i]}
+                    for j, pid in enumerate(bar_pids):
+                        row[f'Bar_{pid}'] = X_data[i][j]
+                    for j, pid in enumerate(skin_pids):
+                        row[f'Skin_{pid}'] = X_data[i][n_bars + j]
+                    rsm_data.append(row)
+                pd.DataFrame(rsm_data).to_csv(os.path.join(base_folder, "rsm_training_data.csv"), index=False)
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "RSM + SQP Complete",
+                    f"Optimization finished!\n\nNastran evaluations: {nastran_count}\nWeight: {best_result['weight']:.6f}t\nMin RF: {best_result['min_rf']:.4f}"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _latin_hypercube_sampling(self, n_samples, n_vars, bounds_low, bounds_high):
+        """Generate Latin Hypercube Samples."""
+        samples = []
+
+        # Create intervals for each variable
+        for i in range(n_samples):
+            sample = []
+            for j in range(n_vars):
+                # Stratified random within interval
+                low = bounds_low[j] + (bounds_high[j] - bounds_low[j]) * (i / n_samples)
+                high = bounds_low[j] + (bounds_high[j] - bounds_low[j]) * ((i + 1) / n_samples)
+                sample.append(random.uniform(low, high))
+            samples.append(sample)
+
+        # Shuffle each column independently for better space-filling
+        samples = np.array(samples)
+        for j in range(n_vars):
+            np.random.shuffle(samples[:, j])
+
+        return samples.tolist()
+
+    def _fit_rsm(self, X, y, bounds_low, bounds_high):
+        """Fit a 2nd order polynomial Response Surface Model."""
+        try:
+            n_samples, n_vars = X.shape
+
+            # Normalize X to [-1, 1]
+            X_norm = np.zeros_like(X)
+            for j in range(n_vars):
+                mid = (bounds_low[j] + bounds_high[j]) / 2
+                half_range = (bounds_high[j] - bounds_low[j]) / 2
+                X_norm[:, j] = (X[:, j] - mid) / half_range if half_range > 0 else 0
+
+            # Build design matrix for quadratic model
+            # [1, x1, x2, ..., x1^2, x2^2, ..., x1*x2, x1*x3, ...]
+            design_matrix = [np.ones(n_samples)]  # Constant term
+
+            # Linear terms
+            for j in range(n_vars):
+                design_matrix.append(X_norm[:, j])
+
+            # Quadratic terms
+            for j in range(n_vars):
+                design_matrix.append(X_norm[:, j] ** 2)
+
+            # Interaction terms (limit to avoid overfitting)
+            if n_vars <= 10:
+                for i, j in combinations(range(n_vars), 2):
+                    design_matrix.append(X_norm[:, i] * X_norm[:, j])
+
+            A = np.column_stack(design_matrix)
+
+            # Solve least squares
+            coeffs, residuals, rank, s = np.linalg.lstsq(A, y, rcond=None)
+
+            # Calculate R²
+            y_pred = A @ coeffs
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+            return {
+                'coeffs': coeffs,
+                'n_vars': n_vars,
+                'bounds_low': bounds_low,
+                'bounds_high': bounds_high,
+                'r2': r2
+            }
+
+        except Exception as e:
+            self.log(f"RSM fitting error: {e}")
+            return None
+
+    def _rsm_predict(self, x, rsm, bounds_low, bounds_high):
+        """Predict using RSM model."""
+        n_vars = rsm['n_vars']
+        coeffs = rsm['coeffs']
+
+        # Normalize x to [-1, 1]
+        x_norm = []
+        for j in range(n_vars):
+            mid = (bounds_low[j] + bounds_high[j]) / 2
+            half_range = (bounds_high[j] - bounds_low[j]) / 2
+            x_norm.append((x[j] - mid) / half_range if half_range > 0 else 0)
+
+        # Build feature vector
+        features = [1.0]  # Constant
+
+        # Linear
+        for j in range(n_vars):
+            features.append(x_norm[j])
+
+        # Quadratic
+        for j in range(n_vars):
+            features.append(x_norm[j] ** 2)
+
+        # Interactions
+        if n_vars <= 10:
+            for i, j in combinations(range(n_vars), 2):
+                features.append(x_norm[i] * x_norm[j])
+
+        return np.dot(features, coeffs)
 
     def _run_fast_ga_internal(self):
         """Internal Fast GA without UI cleanup (for Hybrid)."""
