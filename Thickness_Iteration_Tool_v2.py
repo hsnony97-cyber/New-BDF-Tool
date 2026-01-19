@@ -2080,10 +2080,18 @@ class ThicknessIterationTool:
             self.log("PHASE 1: Design of Experiments (Latin Hypercube)")
             self.log("="*50)
 
-            # Number of initial samples: rule of thumb is (n+1)(n+2)/2 for quadratic model
-            # But we'll use a practical number
-            n_samples = min(max(2 * n_vars + 1, 15), 30)
-            self.log(f"Generating {n_samples} DOE samples...")
+            # Number of initial samples: need at least n_vars + 1 for RSM fitting
+            # Use 2*n_vars + 1 as rule of thumb for good fit
+            n_samples = max(n_vars + 5, 2 * n_vars + 1, 20)
+
+            # Cap to reasonable number to avoid too many Nastran runs
+            max_doe_samples = 150
+            if n_samples > max_doe_samples:
+                self.log(f"WARNING: Large number of variables ({n_vars}). Limiting DOE to {max_doe_samples} samples.")
+                self.log(f"         Consider using Surrogate-Assisted GA for problems with many variables.")
+                n_samples = max_doe_samples
+
+            self.log(f"Generating {n_samples} DOE samples for {n_vars} variables...")
 
             # Latin Hypercube Sampling
             doe_samples = self._latin_hypercube_sampling(n_samples, n_vars, bounds_low, bounds_high)
@@ -2133,7 +2141,10 @@ class ThicknessIterationTool:
                             self.log(f"    *** FEASIBLE SOLUTION ***")
 
             if len(X_data) < n_vars + 1:
-                self.log("ERROR: Not enough valid DOE samples!")
+                self.log(f"ERROR: Not enough valid DOE samples!")
+                self.log(f"       Valid samples: {len(X_data)}, Required: {n_vars + 1} (n_vars + 1)")
+                self.log(f"       Most Nastran runs may have failed. Check BDF file and solver settings.")
+                self.log(f"       Alternatively, try Surrogate-Assisted GA algorithm instead.")
                 return
 
             X_data = np.array(X_data)
