@@ -1244,11 +1244,12 @@ class ThicknessIterationTool:
 
         # Bar weight
         for i, pid in enumerate(bar_pids):
-            t = chromosome[i]
+            dim1 = chromosome[i]  # Optimized dimension
+            dim2 = self.bar_properties[pid].get('dim2', dim1)  # Second dimension from Excel
             rho = self.get_density(pid)
             if pid in self.prop_elements:
                 length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
-                weight += length * t * t * rho
+                weight += length * dim1 * dim2 * rho
 
         # Skin weight
         for i, pid in enumerate(skin_pids):
@@ -3141,11 +3142,13 @@ class ThicknessIterationTool:
                 weight += area * t * rho
 
         for pid in self.bar_properties:
-            t = self.current_bar_thicknesses.get(pid, 0)
+            dim1 = self.current_bar_thicknesses.get(pid, 0)  # Optimized dimension
+            dim2 = self.bar_properties[pid].get('dim2', dim1)  # Second dimension from Excel
             rho = self.get_density(pid)
             if pid in self.prop_elements:
                 length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
-                weight += length * t * t * rho
+                # Cross-sectional area = dim1 * dim2 for rectangular bar
+                weight += length * dim1 * dim2 * rho
 
         return weight
 
