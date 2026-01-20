@@ -53,6 +53,7 @@ class ThicknessIterationTool:
         self.skin_min_thickness = tk.StringVar(value="3.0")
         self.skin_max_thickness = tk.StringVar(value="18.0")
         self.thickness_step = tk.StringVar(value="0.5")
+        self.bar_skin_search_distance = tk.StringVar(value="150.0")  # mm - for proximity-based optimization
 
         # RF settings
         self.target_rf = tk.StringVar(value="1.0")
@@ -88,6 +89,8 @@ class ThicknessIterationTool:
         self.bar_lengths = {}
         self.prop_elements = {}
         self.elem_to_prop = {}
+        self.element_centroids = {}  # EID -> (x, y, z) centroid coordinates
+        self.bar_to_nearby_skins = {}  # Bar PID -> list of nearby Skin PIDs
 
         # Allowable fits (RF Check v2.1 format)
         self.allowable_interp = {}  # PID -> {a, b, r2, excluded, n_pts}
@@ -184,6 +187,8 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Step:").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.thickness_step, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row, text="Bar-Skin Distance (mm):").pack(side=tk.LEFT, padx=10)
+        ttk.Entry(row, textvariable=self.bar_skin_search_distance, width=8).pack(side=tk.LEFT)
 
         # Section 3: RF Settings
         f3 = ttk.LabelFrame(main, text="3. RF Settings", padding=10)
@@ -363,6 +368,9 @@ class ThicknessIterationTool:
             self.bar_lengths = {}
             self.prop_elements = {}
             self.elem_to_prop = {}
+            self.element_centroids = {}
+            self.bar_elements = []  # List of bar element IDs
+            self.shell_elements = []  # List of shell element IDs
 
             shell_count = bar_count = 0
 
@@ -374,20 +382,30 @@ class ThicknessIterationTool:
                         self.prop_elements[pid] = []
                     self.prop_elements[pid].append(eid)
 
+                # Try to get centroid
+                try:
+                    centroid = elem.Centroid()
+                    self.element_centroids[eid] = centroid
+                except:
+                    pass
+
                 if elem.type in ['CQUAD4', 'CTRIA3', 'CQUAD8', 'CTRIA6']:
                     shell_count += 1
+                    self.shell_elements.append(eid)
                     try:
                         self.element_areas[eid] = elem.Area()
                     except:
                         self.element_areas[eid] = 0
                 elif elem.type in ['CBAR', 'CBEAM']:
                     bar_count += 1
+                    self.bar_elements.append(eid)
                     try:
                         self.bar_lengths[eid] = elem.Length()
                     except:
                         self.bar_lengths[eid] = 0
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
+            self.log(f"  Centroids calculated: {len(self.element_centroids)}")
 
             self.bdf_status.config(text=f"✓ {len(self.bdf_model.elements)} elements", foreground="green")
 
@@ -399,6 +417,67 @@ class ThicknessIterationTool:
             import traceback
             self.log(traceback.format_exc())
             self.bdf_status.config(text="Error", foreground="red")
+
+    def calculate_bar_skin_proximity(self):
+        """Calculate which skin properties are near each bar property based on search distance."""
+        import numpy as np
+
+        search_dist = float(self.bar_skin_search_distance.get())
+        self.log(f"\n  Calculating bar-skin proximity (distance={search_dist} mm)...")
+
+        self.bar_to_nearby_skins = {}
+
+        if not self.element_centroids:
+            self.log("    WARNING: No element centroids available!")
+            return
+
+        # Get bar property -> bar element centroids
+        bar_prop_centroids = {}  # bar_pid -> list of centroids
+        for bar_eid in self.bar_elements:
+            if bar_eid in self.element_centroids:
+                bar_pid = self.elem_to_prop.get(bar_eid)
+                if bar_pid and bar_pid in self.bar_properties:
+                    if bar_pid not in bar_prop_centroids:
+                        bar_prop_centroids[bar_pid] = []
+                    bar_prop_centroids[bar_pid].append(self.element_centroids[bar_eid])
+
+        # Get shell property -> shell element centroids
+        shell_prop_centroids = {}  # skin_pid -> list of centroids
+        for shell_eid in self.shell_elements:
+            if shell_eid in self.element_centroids:
+                shell_pid = self.elem_to_prop.get(shell_eid)
+                if shell_pid and shell_pid in self.skin_properties:
+                    if shell_pid not in shell_prop_centroids:
+                        shell_prop_centroids[shell_pid] = []
+                    shell_prop_centroids[shell_pid].append(self.element_centroids[shell_eid])
+
+        # For each bar property, find nearby skin properties
+        for bar_pid, bar_cents in bar_prop_centroids.items():
+            nearby_skins = set()
+
+            for skin_pid, skin_cents in shell_prop_centroids.items():
+                # Check if any bar element is close to any shell element of this property
+                is_nearby = False
+                for bc in bar_cents:
+                    for sc in skin_cents:
+                        dist = np.sqrt((bc[0]-sc[0])**2 + (bc[1]-sc[1])**2 + (bc[2]-sc[2])**2)
+                        if dist <= search_dist:
+                            is_nearby = True
+                            break
+                    if is_nearby:
+                        break
+
+                if is_nearby:
+                    nearby_skins.add(skin_pid)
+
+            self.bar_to_nearby_skins[bar_pid] = nearby_skins
+
+        # Log summary
+        total_connections = sum(len(skins) for skins in self.bar_to_nearby_skins.values())
+        avg_skins = total_connections / len(self.bar_to_nearby_skins) if self.bar_to_nearby_skins else 0
+        self.log(f"    Bar properties: {len(self.bar_to_nearby_skins)}")
+        self.log(f"    Total connections: {total_connections}")
+        self.log(f"    Avg skins per bar: {avg_skins:.1f}")
 
     def load_properties(self):
         path = self.property_excel_path.get()
@@ -2389,6 +2468,9 @@ class ThicknessIterationTool:
             skin_max = float(self.skin_max_thickness.get())
             step = float(self.thickness_step.get())
 
+            # Calculate bar-skin proximity mapping
+            self.calculate_bar_skin_proximity()
+
             # Create output folder
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_folder = os.path.join(self.output_folder.get(), f"topdown_{timestamp}")
@@ -2535,43 +2617,57 @@ class ThicknessIterationTool:
                     new_t = max(bar_min, min(bar_max, new_t))
                     self.current_bar_thicknesses[pid] = new_t
 
-                # Update SKIN thicknesses - based on GLOBAL bar RF (coupled optimization)
+                # Update SKIN thicknesses - PROXIMITY-BASED (coupled optimization)
+                # Each skin is updated based on the RF of NEARBY bars (within search distance)
                 # Skin doesn't have its own allowable, but affects bar stress
-                # If bar RF > target: structure is over-designed, can reduce skin
-                # If bar RF < target: structure needs more stiffness, increase skin
 
                 skin_decreased = 0
                 skin_increased = 0
                 skin_unchanged = 0
 
-                for pid in self.skin_properties:
-                    old_t = self.current_skin_thicknesses[pid]
+                # Build: skin_pid -> controlling bar RF (min RF of nearby bars)
+                skin_controlling_rf = {}
+                for bar_pid, nearby_skins in self.bar_to_nearby_skins.items():
+                    bar_rf = pid_min_rf.get(bar_pid, None)
+                    if bar_rf is None:
+                        continue
+                    for skin_pid in nearby_skins:
+                        if skin_pid not in skin_controlling_rf or bar_rf < skin_controlling_rf[skin_pid]:
+                            skin_controlling_rf[skin_pid] = bar_rf
 
-                    # Use GLOBAL min_rf (bar RF) to decide skin update
-                    if min_rf > target_rf + rf_tol:
-                        # Over-designed: REDUCE skin thickness to save weight
-                        # Use gentler reduction for skin (it affects bars indirectly)
-                        skin_ratio = (target_rf / min_rf) ** (alpha * 0.7)  # Gentler than bar
-                        skin_ratio = max(skin_ratio, 0.85)  # Max 15% reduction per iteration
+                for skin_pid in self.skin_properties:
+                    old_t = self.current_skin_thicknesses[skin_pid]
+
+                    # Use the controlling bar RF for this skin (min RF of nearby bars)
+                    controlling_rf = skin_controlling_rf.get(skin_pid, None)
+
+                    if controlling_rf is None:
+                        # No nearby bars - skin is not coupled, keep unchanged
+                        skin_unchanged += 1
+                        new_t = old_t
+                    elif controlling_rf > target_rf + rf_tol:
+                        # Nearby bars are over-designed: REDUCE skin thickness
+                        skin_ratio = (target_rf / controlling_rf) ** (alpha * 0.7)
+                        skin_ratio = max(skin_ratio, 0.85)  # Max 15% reduction
                         new_t = old_t * skin_ratio
                         skin_decreased += 1
-                    elif min_rf < target_rf - rf_tol:
-                        # Under-designed: INCREASE skin thickness for more stiffness
-                        skin_ratio = (target_rf / min_rf) ** (alpha * 0.7)
-                        skin_ratio = min(skin_ratio, 1.15)  # Max 15% increase per iteration
+                    elif controlling_rf < target_rf - rf_tol:
+                        # Nearby bars are under-designed: INCREASE skin thickness
+                        skin_ratio = (target_rf / controlling_rf) ** (alpha * 0.7)
+                        skin_ratio = min(skin_ratio, 1.15)  # Max 15% increase
                         new_t = old_t * skin_ratio
                         skin_increased += 1
                     else:
-                        # Within tolerance, keep it
+                        # Within tolerance
                         new_t = old_t
                         skin_unchanged += 1
 
                     new_t = max(skin_min, min(skin_max, new_t))
-                    self.current_skin_thicknesses[pid] = new_t
+                    self.current_skin_thicknesses[skin_pid] = new_t
 
                 self.log(f"    Bar properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
                 self.log(f"    Skin properties: {skin_increased} increased, {skin_decreased} decreased, {skin_unchanged} unchanged")
-                self.log(f"    (Skin updated based on global Bar RF = {min_rf:.4f})")
+                self.log(f"    (Skin updated based on nearby bar RF - {len(skin_controlling_rf)} skins coupled)")
 
             # ========== FINAL RESULTS ==========
             self.log("\n" + "="*70)
