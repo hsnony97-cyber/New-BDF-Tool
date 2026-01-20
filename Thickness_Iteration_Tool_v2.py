@@ -40,6 +40,7 @@ class ThicknessIterationTool:
 
         # Input paths
         self.input_bdf_path = tk.StringVar()
+        self.bdf_paths = []  # List of BDF paths for multi-BDF support
         self.allowable_excel_path = tk.StringVar()
         self.property_excel_path = tk.StringVar()
         self.element_excel_path = tk.StringVar()
@@ -135,8 +136,31 @@ class ThicknessIterationTool:
         f1 = ttk.LabelFrame(main, text="1. Input Files", padding=10)
         f1.pack(fill=tk.X, pady=5, padx=10)
 
+        # Multi-BDF selection with Listbox
+        bdf_frame = ttk.Frame(f1)
+        bdf_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(bdf_frame, text="BDF Files:", width=18).pack(side=tk.LEFT, anchor=tk.N)
+
+        bdf_list_frame = ttk.Frame(bdf_frame)
+        bdf_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.bdf_listbox = tk.Listbox(bdf_list_frame, height=3, width=55, selectmode=tk.SINGLE)
+        self.bdf_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        bdf_scroll = ttk.Scrollbar(bdf_list_frame, orient=tk.VERTICAL, command=self.bdf_listbox.yview)
+        bdf_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.bdf_listbox.config(yscrollcommand=bdf_scroll.set)
+
+        bdf_btn_frame = ttk.Frame(bdf_frame)
+        bdf_btn_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Button(bdf_btn_frame, text="Add", command=self.add_bdf, width=8).pack(pady=1)
+        ttk.Button(bdf_btn_frame, text="Remove", command=self.remove_bdf, width=8).pack(pady=1)
+        ttk.Button(bdf_btn_frame, text="Load All", command=self.load_bdf, width=8).pack(pady=1)
+
+        self.bdf_status = ttk.Label(f1, text="No BDF files loaded", foreground="gray")
+        self.bdf_status.pack(anchor=tk.W)
+
         for label, var, cmd, status_name in [
-            ("Main BDF:", self.input_bdf_path, self.load_bdf, "bdf_status"),
             ("Property Excel:", self.property_excel_path, self.load_properties, "prop_status"),
             ("Allowable Excel:", self.allowable_excel_path, self.rf_load_allowable, "allow_status"),
             ("Residual Strength:", self.residual_strength_path, self.load_residual_strength, "resid_status"),
@@ -318,20 +342,55 @@ class ThicknessIterationTool:
         if f:
             self.output_folder.set(f)
 
+    def add_bdf(self):
+        """Add BDF file to the list."""
+        files = filedialog.askopenfilenames(
+            title="Select BDF files",
+            filetypes=[("BDF files", "*.bdf *.dat *.nas"), ("All files", "*.*")]
+        )
+        for f in files:
+            if f and f not in self.bdf_paths:
+                self.bdf_paths.append(f)
+                self.bdf_listbox.insert(tk.END, os.path.basename(f))
+        self.bdf_status.config(text=f"{len(self.bdf_paths)} BDF files selected", foreground="blue")
+
+    def remove_bdf(self):
+        """Remove selected BDF from list."""
+        selection = self.bdf_listbox.curselection()
+        if selection:
+            idx = selection[0]
+            self.bdf_listbox.delete(idx)
+            del self.bdf_paths[idx]
+        self.bdf_status.config(text=f"{len(self.bdf_paths)} BDF files selected", foreground="blue")
+
     # ==================== BDF LOADING ====================
     def load_bdf(self):
-        path = self.input_bdf_path.get()
-        if not path or not os.path.exists(path):
-            messagebox.showerror("Error", "Select BDF file")
+        """Load all BDF files in the list."""
+        if not self.bdf_paths:
+            messagebox.showerror("Error", "Add at least one BDF file")
             return
 
         self.log("\n" + "="*70)
-        self.log("LOADING BDF")
+        self.log("LOADING BDF FILES")
         self.log("="*70)
+        self.log(f"  BDF files to load: {len(self.bdf_paths)}")
+        for i, p in enumerate(self.bdf_paths):
+            self.log(f"    {i+1}. {os.path.basename(p)}")
 
         try:
+            # Load the FIRST BDF as the main model (for geometry extraction)
+            path = self.bdf_paths[0]
+            self.log(f"\n  Loading main BDF: {os.path.basename(path)}")
             self.bdf_model = BDF(debug=False)
             self.bdf_model.read_bdf(path, validate=False, xref=True, read_includes=True, encoding='latin-1')
+
+            # Store all BDF models for multi-BDF processing
+            self.bdf_models = []
+            for bdf_path in self.bdf_paths:
+                self.log(f"  Loading: {os.path.basename(bdf_path)}")
+                model = BDF(debug=False)
+                model.read_bdf(bdf_path, validate=False, xref=True, read_includes=True, encoding='latin-1')
+                self.bdf_models.append({'path': bdf_path, 'model': model, 'name': os.path.basename(bdf_path)})
 
             self.log(f"  Nodes: {len(self.bdf_model.nodes)}")
             self.log(f"  Elements: {len(self.bdf_model.elements)}")
@@ -406,8 +465,9 @@ class ThicknessIterationTool:
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
             self.log(f"  Centroids calculated: {len(self.element_centroids)}")
+            self.log(f"\n  Total BDF models loaded: {len(self.bdf_models)}")
 
-            self.bdf_status.config(text=f"✓ {len(self.bdf_model.elements)} elements", foreground="green")
+            self.bdf_status.config(text=f"✓ {len(self.bdf_models)} BDFs, {len(self.bdf_model.elements)} elements", foreground="green")
 
             if not self.output_folder.get():
                 self.output_folder.set(os.path.dirname(path))
@@ -2909,37 +2969,59 @@ class ThicknessIterationTool:
 
     def _run_iteration(self, folder, iteration, target_rf):
         try:
-            # 1. Write BDF
-            self.log("  [1] Writing BDF...")
-            bdf_path = self._write_bdf(folder)
+            # Handle multiple BDFs
+            n_bdfs = len(self.bdf_models) if hasattr(self, 'bdf_models') and self.bdf_models else 1
+            all_stresses = []
 
-            # 2. Apply offsets
-            self.log("  [2] Applying offsets...")
-            offset_bdf = self._apply_offsets(bdf_path, folder)
+            if n_bdfs > 1:
+                self.log(f"  Processing {n_bdfs} BDF files...")
 
-            # 3. Run Nastran (if available)
-            self.log("  [3] Running Nastran...")
-            self._run_nastran(offset_bdf or bdf_path, folder)
+            for bdf_idx, bdf_info in enumerate(self.bdf_models if n_bdfs > 1 else [{'model': self.bdf_model, 'path': self.bdf_paths[0] if self.bdf_paths else '', 'name': 'main.bdf'}]):
+                bdf_name = bdf_info['name']
+                bdf_subfolder = os.path.join(folder, f"bdf_{bdf_idx+1}_{os.path.splitext(bdf_name)[0]}") if n_bdfs > 1 else folder
+                os.makedirs(bdf_subfolder, exist_ok=True)
 
-            # 4. Extract stresses
-            self.log("  [4] Extracting stresses...")
-            stresses = self._extract_stresses(folder)
+                if n_bdfs > 1:
+                    self.log(f"\n  --- BDF {bdf_idx+1}/{n_bdfs}: {bdf_name} ---")
 
+                # 1. Write BDF
+                self.log("  [1] Writing BDF...")
+                bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], bdf_info['path'])
+
+                # 2. Apply offsets
+                self.log("  [2] Applying offsets...")
+                offset_bdf = self._apply_offsets(bdf_path, bdf_subfolder)
+
+                # 3. Run Nastran
+                self.log("  [3] Running Nastran...")
+                self._run_nastran(offset_bdf or bdf_path, bdf_subfolder)
+
+                # 4. Extract stresses from this BDF's OP2
+                self.log("  [4] Extracting stresses...")
+                stresses = self._extract_stresses(bdf_subfolder)
+                all_stresses.extend(stresses)
+
+                if stresses:
+                    bar_stresses = [s for s in stresses if s['type'] == 'bar']
+                    shell_stresses = [s for s in stresses if s['type'] == 'shell']
+                    self.log(f"    Extracted: {len(bar_stresses)} bar, {len(shell_stresses)} shell stresses")
+
+            # Combine all stresses from all BDFs
+            stresses = all_stresses
             if not stresses:
-                self.log("  WARNING: No stress data extracted! Check if OP2 file exists.")
-                self.log(f"    Looking in: {folder}")
+                self.log("  WARNING: No stress data extracted! Check if OP2 files exist.")
                 op2_files = [f for f in os.listdir(folder) if f.lower().endswith('.op2')]
                 self.log(f"    OP2 files found: {op2_files}")
             else:
-                bar_stresses = [s for s in stresses if s['type'] == 'bar']
-                shell_stresses = [s for s in stresses if s['type'] == 'shell']
-                self.log(f"    Extracted: {len(bar_stresses)} bar, {len(shell_stresses)} shell stresses")
+                total_bar = sum(1 for s in stresses if s['type'] == 'bar')
+                total_shell = sum(1 for s in stresses if s['type'] == 'shell')
+                self.log(f"\n  Total stresses from all BDFs: {total_bar} bar, {total_shell} shell")
 
             # 4.5 Combine stresses using Residual Strength (if loaded)
             combined_stresses = None
             if self.residual_strength_df is not None:
                 self.log("  [4.5] Combining stresses...")
-                combined_stresses = self._combine_stresses(folder)
+                combined_stresses = self._combine_stresses_multi(folder, n_bdfs)
                 if combined_stresses:
                     self.log(f"    Combined: {len(combined_stresses)} stress combinations")
 
@@ -3048,6 +3130,70 @@ class ThicknessIterationTool:
             f.writelines(new_lines)
 
         self.log(f"    BDF written: {output_bdf}")
+        return output_bdf
+
+    def _write_bdf_for_model(self, folder, model, original_path):
+        """Write BDF with updated thicknesses for a specific model (multi-BDF support)."""
+        output_bdf = os.path.join(folder, os.path.basename(original_path))
+
+        with open(original_path, 'r', encoding='latin-1') as f:
+            lines = f.readlines()
+
+        new_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            if line.startswith('PBARL'):
+                try:
+                    pid = int(line[8:16].strip())
+                    if pid in self.current_bar_thicknesses:
+                        t = self.current_bar_thicknesses[pid]
+                        t = max(0.1, t)
+                        new_lines.append(line)
+                        i += 1
+                        while i < len(lines) and (lines[i].startswith('+') or lines[i].startswith('*') or (lines[i][0] == ' ' and lines[i].strip() and not lines[i].strip().startswith('$'))):
+                            cont = lines[i]
+                            if cont.strip() and not cont.strip().startswith('$'):
+                                try:
+                                    original_dim2 = cont[16:24].strip()
+                                    dim2_val = float(original_dim2) if original_dim2 else t
+                                except:
+                                    dim2_val = t
+                                cont_name = cont[:8]
+                                rest = cont[24:] if len(cont) > 24 else '\n'
+                                new_cont = f"{cont_name}{t:8.4f}{dim2_val:8.4f}{rest}"
+                                new_lines.append(new_cont)
+                            else:
+                                new_lines.append(cont)
+                            i += 1
+                        continue
+                except:
+                    pass
+
+            elif line.startswith('PSHELL'):
+                try:
+                    pid = int(line[8:16].strip())
+                    if pid in self.current_skin_thicknesses:
+                        t = self.current_skin_thicknesses[pid]
+                        t = max(0.1, t)
+                        prefix = line[:16]
+                        mid1 = line[16:24]
+                        rest = line[32:] if len(line) > 32 else '\n'
+                        new_line = f"{prefix}{mid1}{t:8.4f}{rest}"
+                        new_lines.append(new_line)
+                        i += 1
+                        continue
+                except:
+                    pass
+
+            new_lines.append(line)
+            i += 1
+
+        with open(output_bdf, 'w', encoding='latin-1') as f:
+            f.writelines(new_lines)
+
+        self.log(f"    BDF written: {os.path.basename(output_bdf)}")
         return output_bdf
 
     def _apply_offsets(self, bdf_path, folder):
@@ -3436,6 +3582,102 @@ class ThicknessIterationTool:
 
         except Exception as e:
             self.log(f"    Combine error: {e}")
+
+        return None
+
+    def _combine_stresses_multi(self, folder, n_bdfs):
+        """Combine stresses from multiple BDFs using Residual Strength table."""
+        if self.residual_strength_df is None or len(self.combination_table) == 0:
+            self.log("    No Residual Strength data - skipping combination")
+            return None
+
+        try:
+            # Collect stress data from all BDF subfolders
+            all_stress_data = []
+
+            if n_bdfs > 1:
+                # Look for subfolders
+                for item in os.listdir(folder):
+                    subfolder = os.path.join(folder, item)
+                    if os.path.isdir(subfolder) and item.startswith('bdf_'):
+                        stress_csv = os.path.join(subfolder, 'bar_stress_results.csv')
+                        if os.path.exists(stress_csv):
+                            df = pd.read_csv(stress_csv)
+                            all_stress_data.append(df)
+                            self.log(f"    Loaded stresses from: {item}")
+            else:
+                # Single BDF case
+                stress_csv = os.path.join(folder, 'bar_stress_results.csv')
+                if os.path.exists(stress_csv):
+                    all_stress_data.append(pd.read_csv(stress_csv))
+
+            if not all_stress_data:
+                self.log("    No bar_stress_results.csv found in any BDF folder")
+                return None
+
+            # Merge all stress data
+            stress_df = pd.concat(all_stress_data, ignore_index=True)
+            self.log(f"    Combined stress data: {len(stress_df)} rows from {len(all_stress_data)} BDFs")
+
+            # Build lookup: (subcase, element) -> stress (use max stress if duplicates)
+            lookup = {}
+            for _, row in stress_df.iterrows():
+                key = (int(row['Subcase']), int(row['Element']))
+                stress_val = row['Stress'] if pd.notna(row['Stress']) else 0
+                if key not in lookup or abs(stress_val) > abs(lookup[key]):
+                    lookup[key] = stress_val
+
+            elements = stress_df['Element'].unique()
+
+            rs_df = self.residual_strength_df
+            cols = rs_df.columns.tolist()
+            comb_col = cols[0]
+
+            results = []
+            for _, rs_row in rs_df.iterrows():
+                comb_lc = rs_row[comb_col]
+                if pd.isna(comb_lc):
+                    continue
+                comb_lc = int(comb_lc)
+
+                for eid in elements:
+                    total_stress = 0.0
+                    components = []
+
+                    for case_col, mult_col in self.combination_table:
+                        case_id = rs_row[case_col]
+                        multiplier = rs_row[mult_col]
+                        if pd.isna(case_id) or pd.isna(multiplier):
+                            continue
+                        case_id = int(case_id)
+                        multiplier = float(multiplier)
+
+                        key = (case_id, int(eid))
+                        if key in lookup:
+                            stress = lookup[key]
+                            if stress is not None:
+                                total_stress += stress * multiplier
+                                components.append(f"{case_id}*{multiplier}")
+
+                    if components:
+                        results.append({
+                            'Combined_LC': comb_lc, 'Element': int(eid),
+                            'Combined_Stress': total_stress,
+                            'Components': ' + '.join(components)
+                        })
+
+            # Save combined results
+            if results:
+                comb_csv = os.path.join(folder, 'combined_stress_results.csv')
+                with open(comb_csv, 'w', newline='') as f:
+                    w = csv.DictWriter(f, fieldnames=['Combined_LC', 'Element', 'Combined_Stress', 'Components'])
+                    w.writeheader()
+                    w.writerows(results)
+                self.log(f"    Saved: combined_stress_results.csv ({len(results)} rows)")
+                return results
+
+        except Exception as e:
+            self.log(f"    Multi-BDF combine error: {e}")
 
         return None
 
