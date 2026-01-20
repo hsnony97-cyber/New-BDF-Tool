@@ -2445,18 +2445,37 @@ class ThicknessIterationTool:
 
                 self.log(f"\n  Summary: Min RF={min_rf:.4f}, Fails={n_fail}, Weight={weight:.6f}t")
 
-                # Check convergence: RF is within tolerance of target
-                rf_margin = min_rf - target_rf
+                # Calculate per-property RF statistics
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
 
-                if target_rf - rf_tol <= min_rf <= target_rf + rf_tol:
-                    self.log(f"\n  *** CONVERGED! RF={min_rf:.4f} is within tolerance of target {target_rf} ***")
+                # Count how many properties are converged (RF within tolerance)
+                n_converged = 0
+                n_total = 0
+                for pid, rf in pid_min_rf.items():
+                    n_total += 1
+                    if target_rf - rf_tol <= rf <= target_rf + rf_tol:
+                        n_converged += 1
+
+                convergence_pct = (n_converged / n_total * 100) if n_total > 0 else 0
+                self.log(f"  Per-Property Convergence: {n_converged}/{n_total} ({convergence_pct:.1f}%) properties at RF≈{target_rf}")
+
+                # Check convergence: ALL properties should be within tolerance
+                if n_total > 0 and n_converged == n_total:
+                    self.log(f"\n  *** FULLY CONVERGED! All {n_total} properties have RF≈{target_rf} ***")
                     converged = True
                     if weight < best_weight:
                         best_weight = weight
                         self.best_solution = result
                     break
 
-                # Track best feasible solution
+                # Track best feasible solution (min RF >= target)
                 if min_rf >= target_rf - rf_tol and weight < best_weight:
                     best_weight = weight
                     self.best_solution = result
@@ -2467,82 +2486,84 @@ class ThicknessIterationTool:
 
                 # Check if stuck
                 if no_improvement_count >= max_no_improvement:
-                    self.log(f"\n  No improvement for {max_no_improvement} iterations. Consider stopping.")
+                    self.log(f"\n  No improvement for {max_no_improvement} iterations.")
 
-                # ========== Update thicknesses based on RF ==========
-                if min_rf > target_rf + rf_tol:
-                    # Over-designed: REDUCE thicknesses
-                    # Use stress ratio method: new_t = old_t * (target_rf / actual_rf)^alpha
-                    # alpha < 1 for stability (typically 0.3-0.5)
-                    alpha = 0.4  # Conservative reduction factor
-                    reduction_factor = (target_rf / min_rf) ** alpha
-                    reduction_factor = max(reduction_factor, 0.7)  # Don't reduce more than 30% per iteration
+                # ========== FULLY STRESSED DESIGN: Per-Property Update ==========
+                # Each property is updated based on its OWN RF, not global min RF
+                # Goal: Make ALL properties have RF ≈ target (1.0)
 
-                    self.log(f"\n  RF > target: Reducing thicknesses (factor={reduction_factor:.3f})")
+                self.log(f"\n  Applying Fully Stressed Design (per-property)...")
 
-                    # Smart reduction: reduce based on per-element RF
-                    rf_details = result.get('rf_details', [])
-                    pid_min_rf = {}
-                    for d in rf_details:
-                        pid = d.get('pid')
-                        rf = d.get('rf', 0)
-                        if pid:
-                            if pid not in pid_min_rf or rf < pid_min_rf[pid]:
-                                pid_min_rf[pid] = rf
+                # pid_min_rf already calculated above
 
-                    # Update bar thicknesses
-                    for pid in self.bar_properties:
-                        old_t = self.current_bar_thicknesses[pid]
-                        prop_rf = pid_min_rf.get(pid, min_rf)
+                # Stress ratio exponent (alpha < 1 for stability)
+                alpha = 0.5  # Higher value = faster convergence but less stable
 
-                        if prop_rf > target_rf + rf_tol:
-                            # This property can be reduced
-                            prop_factor = (target_rf / prop_rf) ** alpha
-                            prop_factor = max(prop_factor, 0.7)
-                            new_t = old_t * prop_factor
-                        else:
-                            # This property is near target or below, keep it
-                            new_t = old_t
+                # Track changes
+                increased_count = 0
+                decreased_count = 0
+                unchanged_count = 0
 
-                        new_t = max(bar_min, min(bar_max, new_t))
-                        self.current_bar_thicknesses[pid] = new_t
+                # Update BAR thicknesses - each property independently
+                for pid in self.bar_properties:
+                    old_t = self.current_bar_thicknesses[pid]
+                    prop_rf = pid_min_rf.get(pid, None)
 
-                    # Update skin thicknesses
-                    for pid in self.skin_properties:
-                        old_t = self.current_skin_thicknesses[pid]
-                        prop_rf = pid_min_rf.get(pid, min_rf)
+                    if prop_rf is None:
+                        # No RF data for this property, skip
+                        unchanged_count += 1
+                        continue
 
-                        if prop_rf > target_rf + rf_tol:
-                            prop_factor = (target_rf / prop_rf) ** alpha
-                            prop_factor = max(prop_factor, 0.7)
-                            new_t = old_t * prop_factor
-                        else:
-                            new_t = old_t
+                    # Stress Ratio Method: new_t = old_t * (target_rf / actual_rf)^alpha
+                    if prop_rf > target_rf + rf_tol:
+                        # Over-designed: REDUCE thickness
+                        ratio = (target_rf / prop_rf) ** alpha
+                        ratio = max(ratio, 0.7)  # Max 30% reduction per iteration
+                        new_t = old_t * ratio
+                        decreased_count += 1
+                    elif prop_rf < target_rf - rf_tol:
+                        # Under-designed: INCREASE thickness
+                        ratio = (target_rf / prop_rf) ** alpha
+                        ratio = min(ratio, 1.3)  # Max 30% increase per iteration
+                        new_t = old_t * ratio
+                        increased_count += 1
+                    else:
+                        # Within tolerance, keep it
+                        new_t = old_t
+                        unchanged_count += 1
 
-                        new_t = max(skin_min, min(skin_max, new_t))
-                        self.current_skin_thicknesses[pid] = new_t
+                    new_t = max(bar_min, min(bar_max, new_t))
+                    self.current_bar_thicknesses[pid] = new_t
 
-                elif min_rf < target_rf - rf_tol:
-                    # Under-designed (RF too low): INCREASE failing properties
-                    self.log(f"\n  RF < target: Increasing failing properties")
+                # Update SKIN thicknesses - each property independently
+                for pid in self.skin_properties:
+                    old_t = self.current_skin_thicknesses[pid]
+                    prop_rf = pid_min_rf.get(pid, None)
 
-                    failing_pids = result.get('failing_pids', set())
+                    if prop_rf is None:
+                        unchanged_count += 1
+                        continue
 
-                    for pid in failing_pids:
-                        if pid in self.current_bar_thicknesses:
-                            old_t = self.current_bar_thicknesses[pid]
-                            new_t = min(bar_max, old_t * (1 + step))
-                            self.current_bar_thicknesses[pid] = new_t
-                        elif pid in self.current_skin_thicknesses:
-                            old_t = self.current_skin_thicknesses[pid]
-                            new_t = min(skin_max, old_t * (1 + step))
-                            self.current_skin_thicknesses[pid] = new_t
+                    if prop_rf > target_rf + rf_tol:
+                        # Over-designed: REDUCE thickness
+                        ratio = (target_rf / prop_rf) ** alpha
+                        ratio = max(ratio, 0.7)
+                        new_t = old_t * ratio
+                        decreased_count += 1
+                    elif prop_rf < target_rf - rf_tol:
+                        # Under-designed: INCREASE thickness
+                        ratio = (target_rf / prop_rf) ** alpha
+                        ratio = min(ratio, 1.3)
+                        new_t = old_t * ratio
+                        increased_count += 1
+                    else:
+                        new_t = old_t
+                        unchanged_count += 1
 
-                    self.log(f"    Increased {len(failing_pids)} failing properties")
+                    new_t = max(skin_min, min(skin_max, new_t))
+                    self.current_skin_thicknesses[pid] = new_t
 
-                else:
-                    # Within tolerance
-                    self.log(f"\n  RF within tolerance - fine tuning")
+                self.log(f"    Properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
 
             # ========== FINAL RESULTS ==========
             self.log("\n" + "="*70)
