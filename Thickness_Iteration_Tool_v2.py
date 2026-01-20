@@ -2565,6 +2565,14 @@ class ThicknessIterationTool:
 
                 self.log(f"    Properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
 
+                # Debug: Show RF data coverage
+                bar_with_rf = sum(1 for pid in self.bar_properties if pid in pid_min_rf)
+                skin_with_rf = sum(1 for pid in self.skin_properties if pid in pid_min_rf)
+                self.log(f"    RF Data: Bar {bar_with_rf}/{len(self.bar_properties)}, Skin {skin_with_rf}/{len(self.skin_properties)}")
+
+                if skin_with_rf == 0 and len(self.skin_properties) > 0:
+                    self.log(f"    WARNING: No RF data for skin properties! Check if shell stresses are in OP2.")
+
             # ========== FINAL RESULTS ==========
             self.log("\n" + "="*70)
             self.log("TOP-DOWN OPTIMIZATION COMPLETE")
@@ -3208,16 +3216,45 @@ class ThicknessIterationTool:
                                     'Stress': float(stress) if stress else None
                                 })
 
-                    # SHELL STRESS from cquad4_stress
-                    if hasattr(op2, 'cquad4_stress') and op2.cquad4_stress:
-                        for sc_id, data in op2.cquad4_stress.items():
-                            for i, eid in enumerate(data.element):
-                                stress = data.data[0, i, -1] if len(data.data.shape) == 3 else data.data[i, -1]
-                                results.append({
-                                    'eid': int(eid), 'type': 'shell',
-                                    'stress': float(stress),
-                                    'subcase': int(sc_id)
-                                })
+                    # SHELL STRESS - try multiple stress result types
+                    shell_stress_count = 0
+
+                    # List of shell stress attributes to try
+                    shell_stress_attrs = [
+                        ('cquad4_stress', 'CQUAD4'),
+                        ('ctria3_stress', 'CTRIA3'),
+                        ('cquad8_stress', 'CQUAD8'),
+                        ('ctria6_stress', 'CTRIA6'),
+                        ('cquad4_composite_stress', 'CQUAD4_COMP'),
+                        ('ctria3_composite_stress', 'CTRIA3_COMP'),
+                    ]
+
+                    for attr_name, stress_type in shell_stress_attrs:
+                        if hasattr(op2, attr_name):
+                            stress_data = getattr(op2, attr_name)
+                            if stress_data:
+                                for sc_id, data in stress_data.items():
+                                    for i, eid in enumerate(data.element):
+                                        # Try to get von Mises stress (usually last column)
+                                        try:
+                                            if len(data.data.shape) == 3:
+                                                stress = data.data[0, i, -1]
+                                            else:
+                                                stress = data.data[i, -1]
+                                            results.append({
+                                                'eid': int(eid), 'type': 'shell',
+                                                'stress': float(abs(stress)),
+                                                'subcase': int(sc_id)
+                                            })
+                                            shell_stress_count += 1
+                                        except Exception:
+                                            pass
+
+                    # Log available stress attributes for debugging
+                    if shell_stress_count == 0:
+                        available_attrs = [attr for attr in dir(op2) if 'stress' in attr.lower() and not attr.startswith('_')]
+                        self.log(f"    DEBUG: No shell stress found. Available: {available_attrs[:10]}")
+
                 except Exception as e:
                     self.log(f"    OP2 read error: {e}")
 
