@@ -2535,43 +2535,43 @@ class ThicknessIterationTool:
                     new_t = max(bar_min, min(bar_max, new_t))
                     self.current_bar_thicknesses[pid] = new_t
 
-                # Update SKIN thicknesses - each property independently
+                # Update SKIN thicknesses - based on GLOBAL bar RF (coupled optimization)
+                # Skin doesn't have its own allowable, but affects bar stress
+                # If bar RF > target: structure is over-designed, can reduce skin
+                # If bar RF < target: structure needs more stiffness, increase skin
+
+                skin_decreased = 0
+                skin_increased = 0
+                skin_unchanged = 0
+
                 for pid in self.skin_properties:
                     old_t = self.current_skin_thicknesses[pid]
-                    prop_rf = pid_min_rf.get(pid, None)
 
-                    if prop_rf is None:
-                        unchanged_count += 1
-                        continue
-
-                    if prop_rf > target_rf + rf_tol:
-                        # Over-designed: REDUCE thickness
-                        ratio = (target_rf / prop_rf) ** alpha
-                        ratio = max(ratio, 0.7)
-                        new_t = old_t * ratio
-                        decreased_count += 1
-                    elif prop_rf < target_rf - rf_tol:
-                        # Under-designed: INCREASE thickness
-                        ratio = (target_rf / prop_rf) ** alpha
-                        ratio = min(ratio, 1.3)
-                        new_t = old_t * ratio
-                        increased_count += 1
+                    # Use GLOBAL min_rf (bar RF) to decide skin update
+                    if min_rf > target_rf + rf_tol:
+                        # Over-designed: REDUCE skin thickness to save weight
+                        # Use gentler reduction for skin (it affects bars indirectly)
+                        skin_ratio = (target_rf / min_rf) ** (alpha * 0.7)  # Gentler than bar
+                        skin_ratio = max(skin_ratio, 0.85)  # Max 15% reduction per iteration
+                        new_t = old_t * skin_ratio
+                        skin_decreased += 1
+                    elif min_rf < target_rf - rf_tol:
+                        # Under-designed: INCREASE skin thickness for more stiffness
+                        skin_ratio = (target_rf / min_rf) ** (alpha * 0.7)
+                        skin_ratio = min(skin_ratio, 1.15)  # Max 15% increase per iteration
+                        new_t = old_t * skin_ratio
+                        skin_increased += 1
                     else:
+                        # Within tolerance, keep it
                         new_t = old_t
-                        unchanged_count += 1
+                        skin_unchanged += 1
 
                     new_t = max(skin_min, min(skin_max, new_t))
                     self.current_skin_thicknesses[pid] = new_t
 
-                self.log(f"    Properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
-
-                # Debug: Show RF data coverage
-                bar_with_rf = sum(1 for pid in self.bar_properties if pid in pid_min_rf)
-                skin_with_rf = sum(1 for pid in self.skin_properties if pid in pid_min_rf)
-                self.log(f"    RF Data: Bar {bar_with_rf}/{len(self.bar_properties)}, Skin {skin_with_rf}/{len(self.skin_properties)}")
-
-                if skin_with_rf == 0 and len(self.skin_properties) > 0:
-                    self.log(f"    WARNING: No RF data for skin properties! Check if shell stresses are in OP2.")
+                self.log(f"    Bar properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
+                self.log(f"    Skin properties: {skin_increased} increased, {skin_decreased} decreased, {skin_unchanged} unchanged")
+                self.log(f"    (Skin updated based on global Bar RF = {min_rf:.4f})")
 
             # ========== FINAL RESULTS ==========
             self.log("\n" + "="*70)
