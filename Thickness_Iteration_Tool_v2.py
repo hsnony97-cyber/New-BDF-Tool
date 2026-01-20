@@ -2380,14 +2380,14 @@ class ThicknessIterationTool:
             self.log("Strategy: Start overdesigned, reduce until RF = target")
             self.log("="*70)
 
-            max_iter = self.max_iterations.get()
-            target_rf = self.target_rf.get()
-            rf_tol = self.rf_tolerance.get()
-            bar_min = self.bar_min.get()
-            bar_max = self.bar_max.get()
-            skin_min = self.skin_min.get()
-            skin_max = self.skin_max.get()
-            step = self.step_size.get()
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
 
             # Create output folder
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
