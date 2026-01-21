@@ -2536,19 +2536,37 @@ class ThicknessIterationTool:
             base_folder = os.path.join(self.output_folder.get(), f"topdown_{timestamp}")
             os.makedirs(base_folder, exist_ok=True)
 
-            # ========== PHASE 1: Initialize at MAXIMUM thicknesses ==========
+            # ========== PHASE 1: Initialize thicknesses ==========
             self.log("\n" + "="*50)
-            self.log("PHASE 1: Initialize at MAXIMUM thicknesses")
+            self.log("PHASE 1: Initialize thicknesses")
             self.log("="*50)
 
-            # Set all properties to MAXIMUM
+            # Bar properties: ALL start at MAXIMUM
             for pid in self.bar_properties:
                 self.current_bar_thicknesses[pid] = bar_max
-            for pid in self.skin_properties:
-                self.current_skin_thicknesses[pid] = skin_max
 
-            self.log(f"  Bar thicknesses set to: {bar_max}")
-            self.log(f"  Skin thicknesses set to: {skin_max}")
+            # Skin properties: Related (near bars) → MAX, Unrelated → MIN
+            # Find all skin PIDs that are related to any bar
+            related_skins = set()
+            for bar_pid, nearby_skins in self.bar_to_nearby_skins.items():
+                related_skins.update(nearby_skins)
+
+            related_count = 0
+            unrelated_count = 0
+            for pid in self.skin_properties:
+                if pid in related_skins:
+                    # Related to bars - start at MAX (will be optimized)
+                    self.current_skin_thicknesses[pid] = skin_max
+                    related_count += 1
+                else:
+                    # Not related to any bar - start at MIN (save weight)
+                    self.current_skin_thicknesses[pid] = skin_min
+                    unrelated_count += 1
+
+            self.log(f"  Bar thicknesses: {len(self.bar_properties)} properties → MAX ({bar_max})")
+            self.log(f"  Skin thicknesses:")
+            self.log(f"    Related (near bars): {related_count} properties → MAX ({skin_max})")
+            self.log(f"    Unrelated (far): {unrelated_count} properties → MIN ({skin_min})")
 
             # ========== PHASE 2: Iterative Lightening ==========
             self.log("\n" + "="*50)
