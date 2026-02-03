@@ -70,6 +70,7 @@ class ThicknessIterationTool:
         # Internal data storage
         self.bar_properties = {}
         self.skin_properties = {}
+        self.pbarl_dims = {}  # PID -> {'dim1': val, 'dim2': val} from BDF PBARL
         self.allowable_interp = {}  # Power law fits for bars
         self.skin_allowable_interp = {}  # Power law fits for skins
         self.residual_strength_df = None
@@ -407,6 +408,26 @@ class ThicknessIterationTool:
                         self.bar_lengths[eid] = length
                     except:
                         self.bar_lengths[eid] = 0
+
+            # Extract PBARL dimensions from BDF (for accurate Dim2 values)
+            self.pbarl_dims = {}
+            for pid, prop in self.bdf_model.properties.items():
+                if prop.type == 'PBARL':
+                    dims = prop.dim if hasattr(prop, 'dim') else []
+                    if len(dims) >= 2:
+                        self.pbarl_dims[pid] = {
+                            'dim1': dims[0],
+                            'dim2': dims[1],
+                        }
+                    elif len(dims) == 1:
+                        self.pbarl_dims[pid] = {
+                            'dim1': dims[0],
+                            'dim2': dims[0],
+                        }
+            if self.pbarl_dims:
+                self.log(f"  PBARL dimensions extracted: {len(self.pbarl_dims)} properties")
+                for pid, d in self.pbarl_dims.items():
+                    self.log(f"    PID {pid}: dim1={d['dim1']}, dim2={d['dim2']}")
 
             self.log(f"  Shell elements: {shell_count}")
             self.log(f"  Bar elements: {bar_count}")
@@ -943,11 +964,16 @@ class ThicknessIterationTool:
                             while i < len(lines) and (lines[i].startswith('+') or lines[i].startswith('*') or lines[i].startswith(' ')):
                                 cont_line = lines[i]
                                 if cont_line.strip() and not cont_line.strip().startswith('$'):
-                                    # This is a continuation line, update dimensions
+                                    # This is a continuation line, update DIM1, keep original DIM2
                                     # Format: +name   DIM1    DIM2    ...
+                                    try:
+                                        original_dim2 = cont_line[16:24].strip()
+                                        dim2_val = float(original_dim2) if original_dim2 else bar_t
+                                    except:
+                                        dim2_val = bar_t
                                     new_cont = cont_line[:8]  # Keep continuation marker
-                                    new_cont += f"{bar_t:8.4f}"  # DIM1
-                                    new_cont += f"{bar_t:8.4f}"  # DIM2
+                                    new_cont += f"{bar_t:8.4f}"  # DIM1 (updated)
+                                    new_cont += f"{dim2_val:8.4f}"  # DIM2 (original from BDF)
                                     if len(cont_line) > 24:
                                         new_cont += cont_line[24:]
                                     else:
@@ -1369,11 +1395,16 @@ class ThicknessIterationTool:
                     skin_weight = total_area * skin_t * density
                     total_weight += skin_weight
 
-            # Bar weight: length * dim1 * dim2 * density (assuming square section)
+            # Bar weight: length * dim1 * dim2 * density
             for pid in self.bar_properties:
                 if pid in self.prop_elements:
                     total_length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
-                    bar_weight = total_length * bar_t * bar_t * density
+                    # Use BDF PBARL dim2 (original geometry), fallback to bar_t
+                    if pid in self.pbarl_dims:
+                        dim2 = self.pbarl_dims[pid]['dim2']
+                    else:
+                        dim2 = bar_t
+                    bar_weight = total_length * bar_t * dim2 * density
                     total_weight += bar_weight
 
             return total_weight

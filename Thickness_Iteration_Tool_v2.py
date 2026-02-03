@@ -76,6 +76,7 @@ class ThicknessIterationTool:
         self.bdf_model = None
         self.bar_properties = {}
         self.skin_properties = {}
+        self.pbarl_dims = {}  # PID -> {'dim1': val, 'dim2': val} from BDF PBARL
 
         # Per-property current thicknesses
         self.current_bar_thicknesses = {}  # PID -> thickness
@@ -462,6 +463,26 @@ class ThicknessIterationTool:
                         self.bar_lengths[eid] = elem.Length()
                     except:
                         self.bar_lengths[eid] = 0
+
+            # Extract PBARL dimensions from BDF (for accurate Dim2 values)
+            self.pbarl_dims = {}
+            for pid, prop in self.bdf_model.properties.items():
+                if prop.type == 'PBARL':
+                    dims = prop.dim if hasattr(prop, 'dim') else []
+                    if len(dims) >= 2:
+                        self.pbarl_dims[pid] = {
+                            'dim1': dims[0],
+                            'dim2': dims[1],
+                        }
+                    elif len(dims) == 1:
+                        self.pbarl_dims[pid] = {
+                            'dim1': dims[0],
+                            'dim2': dims[0],
+                        }
+            if self.pbarl_dims:
+                self.log(f"  PBARL dimensions extracted: {len(self.pbarl_dims)} properties")
+                for pid, d in self.pbarl_dims.items():
+                    self.log(f"    PID {pid}: dim1={d['dim1']}, dim2={d['dim2']}")
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
             self.log(f"  Centroids calculated: {len(self.element_centroids)}")
@@ -1388,7 +1409,11 @@ class ThicknessIterationTool:
         # Bar weight
         for i, pid in enumerate(bar_pids):
             dim1 = chromosome[i]  # Optimized dimension
-            dim2 = self.bar_properties[pid].get('dim2', dim1)  # Second dimension from Excel
+            # Use BDF PBARL dim2 (original geometry), fallback to Excel
+            if pid in self.pbarl_dims:
+                dim2 = self.pbarl_dims[pid]['dim2']
+            else:
+                dim2 = self.bar_properties[pid].get('dim2', dim1)
             rho = self.get_density(pid)
             if pid in self.prop_elements:
                 length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
@@ -3742,10 +3767,14 @@ class ThicknessIterationTool:
                                 pid = self.elem_to_prop.get(int(eid))
                                 d1 = d2 = area = stress = None
 
-                                # Get dimensions from bar_properties (loaded from Excel)
+                                # Get dimensions: dim1 from current optimization, dim2 from BDF PBARL
                                 if pid and pid in self.bar_properties:
                                     d1 = self.current_bar_thicknesses.get(pid, self.bar_properties[pid].get('dim1', 0))
-                                    d2 = self.bar_properties[pid].get('dim2', d1)
+                                    # Use BDF PBARL dim2 (original geometry), fallback to Excel
+                                    if pid in self.pbarl_dims:
+                                        d2 = self.pbarl_dims[pid]['dim2']
+                                    else:
+                                        d2 = self.bar_properties[pid].get('dim2', d1)
                                     area = d1 * d2
                                     if area > 0:
                                         stress = axial / area
@@ -4076,7 +4105,11 @@ class ThicknessIterationTool:
 
         for pid in self.bar_properties:
             dim1 = self.current_bar_thicknesses.get(pid, 0)  # Optimized dimension
-            dim2 = self.bar_properties[pid].get('dim2', dim1)  # Second dimension from Excel
+            # Use BDF PBARL dim2 (original geometry), fallback to Excel
+            if pid in self.pbarl_dims:
+                dim2 = self.pbarl_dims[pid]['dim2']
+            else:
+                dim2 = self.bar_properties[pid].get('dim2', dim1)
             rho = self.get_density(pid)
             if pid in self.prop_elements:
                 length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
