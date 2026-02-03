@@ -240,7 +240,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -1083,6 +1083,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_hybrid_ga, daemon=True).start()
         elif algo == "Top-Down (Max to Target)":
             threading.Thread(target=self._run_topdown_algorithm, daemon=True).start()
+        elif algo == "Bottom-Up (Min to Target)":
+            threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
         else:
             threading.Thread(target=self._run_simple_iterative, daemon=True).start()
 
@@ -2775,6 +2777,291 @@ class ThicknessIterationTool:
 
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Top-Down Complete",
+                    f"Optimization Complete!\n\n"
+                    f"Best RF: {self.best_solution['min_rf']:.4f}\n"
+                    f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
+                    f"Iterations: {iteration}\n"
+                    f"Converged: {'Yes' if converged else 'No'}"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_bottomup_algorithm(self):
+        """Algorithm 8: Bottom-Up - Start from min thickness, increase until RF reaches target.
+
+        This is an inverse Fully Stressed Design (FSD) approach:
+        1. Start with minimum thicknesses (structure is under-designed, RF << target)
+        2. Increase thicknesses proportionally based on RF deficit
+        3. Stop when RF approaches target (optimal weight)
+
+        Advantages:
+        - Always starts from lightest possible design
+        - Builds up only where needed
+        - Converges to minimum weight with RF ≈ target
+        """
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: BOTTOM-UP (MIN TO TARGET)")
+            self.log("="*70)
+            self.log("Strategy: Start underdesigned, increase until RF = target")
+            self.log("="*70)
+
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
+
+            # Calculate bar-skin proximity mapping
+            self.calculate_bar_skin_proximity()
+
+            # Create output folder
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"bottomup_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== PHASE 1: Initialize thicknesses ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: Initialize thicknesses at MINIMUM")
+            self.log("="*50)
+
+            # Bar properties: ALL start at MINIMUM
+            for pid in self.bar_properties:
+                self.current_bar_thicknesses[pid] = bar_min
+
+            # Skin properties: Related (near bars) → MIN, Unrelated → MIN
+            # Both start at MIN, but related skins will be optimized with bars
+            related_skins = set()
+            for bar_pid, nearby_skins in self.bar_to_nearby_skins.items():
+                related_skins.update(nearby_skins)
+
+            related_count = 0
+            unrelated_count = 0
+            for pid in self.skin_properties:
+                if pid in related_skins:
+                    self.current_skin_thicknesses[pid] = skin_min
+                    related_count += 1
+                else:
+                    self.current_skin_thicknesses[pid] = skin_min
+                    unrelated_count += 1
+
+            self.log(f"  Bar thicknesses: {len(self.bar_properties)} properties → MIN ({bar_min})")
+            self.log(f"  Skin thicknesses:")
+            self.log(f"    Related (near bars): {related_count} properties → MIN ({skin_min})")
+            self.log(f"    Unrelated (far): {unrelated_count} properties → MIN ({skin_min})")
+
+            # ========== PHASE 2: Iterative Strengthening ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: Iterative Strengthening")
+            self.log("="*50)
+
+            best_weight = float('inf')
+            converged = False
+            no_improvement_count = 0
+            max_no_improvement = 5
+
+            for iteration in range(1, max_iter + 1):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*50}")
+                self.log(f"ITERATION {iteration}/{max_iter}")
+                self.log(f"{'='*50}")
+
+                iter_folder = os.path.join(base_folder, f"iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+
+                self.update_progress((iteration/max_iter)*100, f"Iter {iteration}/{max_iter}")
+
+                # Run Nastran and get RF
+                result = self._run_iteration(iter_folder, iteration, target_rf)
+
+                if not result:
+                    self.log("  ERROR: Iteration failed!")
+                    continue
+
+                self.iteration_results.append(result)
+                min_rf = result['min_rf']
+                weight = result['weight']
+                n_fail = result['n_fail']
+
+                self.log(f"\n  Summary: Min RF={min_rf:.4f}, Fails={n_fail}, Weight={weight:.6f}t")
+
+                # Calculate per-property RF statistics
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                # Count how many properties are converged (RF within tolerance)
+                n_converged = 0
+                n_total = 0
+                for pid, rf in pid_min_rf.items():
+                    n_total += 1
+                    if target_rf - rf_tol <= rf <= target_rf + rf_tol:
+                        n_converged += 1
+
+                convergence_pct = (n_converged / n_total * 100) if n_total > 0 else 0
+                self.log(f"  Per-Property Convergence: {n_converged}/{n_total} ({convergence_pct:.1f}%) properties at RF≈{target_rf}")
+
+                # Check convergence: ALL properties should be within tolerance
+                if n_total > 0 and n_converged == n_total:
+                    self.log(f"\n  *** FULLY CONVERGED! All {n_total} properties have RF≈{target_rf} ***")
+                    converged = True
+                    if weight < best_weight:
+                        best_weight = weight
+                        self.best_solution = result
+                    break
+
+                # Track best feasible solution (min RF >= target)
+                if min_rf >= target_rf - rf_tol and weight < best_weight:
+                    best_weight = weight
+                    self.best_solution = result
+                    self.log(f"  *** NEW BEST: Weight={weight:.6f}t ***")
+                    no_improvement_count = 0
+                else:
+                    no_improvement_count += 1
+
+                # Check if stuck
+                if no_improvement_count >= max_no_improvement:
+                    self.log(f"\n  No improvement for {max_no_improvement} iterations.")
+
+                # ========== FULLY STRESSED DESIGN: Per-Property Update ==========
+                # Each property is updated based on its OWN RF, not global min RF
+                # Goal: Make ALL properties have RF ≈ target (1.0)
+
+                self.log(f"\n  Applying Fully Stressed Design (per-property, bottom-up)...")
+
+                # Stress ratio exponent (alpha < 1 for stability)
+                alpha = 0.5
+
+                # Track changes
+                increased_count = 0
+                decreased_count = 0
+                unchanged_count = 0
+
+                # Update BAR thicknesses - each property independently
+                for pid in self.bar_properties:
+                    old_t = self.current_bar_thicknesses[pid]
+                    prop_rf = pid_min_rf.get(pid, None)
+
+                    if prop_rf is None:
+                        unchanged_count += 1
+                        continue
+
+                    # Stress Ratio Method: new_t = old_t * (target_rf / actual_rf)^alpha
+                    if prop_rf < target_rf - rf_tol:
+                        # Under-designed: INCREASE thickness (primary direction in bottom-up)
+                        ratio = (target_rf / prop_rf) ** alpha
+                        ratio = min(ratio, 1.3)  # Max 30% increase per iteration
+                        new_t = old_t * ratio
+                        increased_count += 1
+                    elif prop_rf > target_rf + rf_tol:
+                        # Over-designed: REDUCE thickness
+                        ratio = (target_rf / prop_rf) ** alpha
+                        ratio = max(ratio, 0.7)  # Max 30% reduction per iteration
+                        new_t = old_t * ratio
+                        decreased_count += 1
+                    else:
+                        # Within tolerance, keep it
+                        new_t = old_t
+                        unchanged_count += 1
+
+                    new_t = max(bar_min, min(bar_max, new_t))
+                    self.current_bar_thicknesses[pid] = new_t
+
+                # Update SKIN thicknesses - PROXIMITY-BASED (coupled optimization)
+                skin_decreased = 0
+                skin_increased = 0
+                skin_unchanged = 0
+
+                # Build: skin_pid -> controlling bar RF (min RF of nearby bars)
+                skin_controlling_rf = {}
+                for bar_pid, nearby_skins in self.bar_to_nearby_skins.items():
+                    bar_rf = pid_min_rf.get(bar_pid, None)
+                    if bar_rf is None:
+                        continue
+                    for skin_pid in nearby_skins:
+                        if skin_pid not in skin_controlling_rf or bar_rf < skin_controlling_rf[skin_pid]:
+                            skin_controlling_rf[skin_pid] = bar_rf
+
+                for skin_pid in self.skin_properties:
+                    old_t = self.current_skin_thicknesses[skin_pid]
+
+                    controlling_rf = skin_controlling_rf.get(skin_pid, None)
+
+                    if controlling_rf is None:
+                        # No nearby bars - skin is not coupled, keep at MIN
+                        skin_unchanged += 1
+                        new_t = old_t
+                    elif controlling_rf < target_rf - rf_tol:
+                        # Nearby bars are under-designed: INCREASE skin thickness
+                        skin_ratio = (target_rf / controlling_rf) ** (alpha * 0.7)
+                        skin_ratio = min(skin_ratio, 1.15)  # Max 15% increase
+                        new_t = old_t * skin_ratio
+                        skin_increased += 1
+                    elif controlling_rf > target_rf + rf_tol:
+                        # Nearby bars are over-designed: REDUCE skin thickness
+                        skin_ratio = (target_rf / controlling_rf) ** (alpha * 0.7)
+                        skin_ratio = max(skin_ratio, 0.85)  # Max 15% reduction
+                        new_t = old_t * skin_ratio
+                        skin_decreased += 1
+                    else:
+                        # Within tolerance
+                        new_t = old_t
+                        skin_unchanged += 1
+
+                    new_t = max(skin_min, min(skin_max, new_t))
+                    self.current_skin_thicknesses[skin_pid] = new_t
+
+                self.log(f"    Bar properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
+                self.log(f"    Skin properties: {skin_increased} increased, {skin_decreased} decreased, {skin_unchanged} unchanged")
+                self.log(f"    (Skin updated based on nearby bar RF - {len(skin_controlling_rf)} skins coupled)")
+
+            # ========== FINAL RESULTS ==========
+            self.log("\n" + "="*70)
+            self.log("BOTTOM-UP OPTIMIZATION COMPLETE")
+            self.log("="*70)
+
+            if self.best_solution:
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {self.best_solution['min_rf']:.4f}")
+                self.log(f"  Weight: {self.best_solution['weight']:.6f} tonnes")
+                self.log(f"  Found at iteration: {self.best_solution['iteration']}")
+                self.log(f"  Converged: {'Yes' if converged else 'No'}")
+
+                self._generate_final_report(base_folder, "Bottom-Up (Min to Target)",
+                    nastran_count=iteration,
+                    extra_info={
+                        "Strategy": "Inverse Fully Stressed Design",
+                        "Start": "Minimum thicknesses",
+                        "Converged": "Yes" if converged else "No",
+                        "Final Iterations": iteration
+                    })
+
+                self.root.after(0, lambda: self.result_summary.config(
+                    text=f"Best: Weight={self.best_solution['weight']:.6f}t, RF={self.best_solution['min_rf']:.4f}",
+                    foreground="green"
+                ))
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Bottom-Up Complete",
                     f"Optimization Complete!\n\n"
                     f"Best RF: {self.best_solution['min_rf']:.4f}\n"
                     f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
