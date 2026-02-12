@@ -93,6 +93,7 @@ class ThicknessIterationTool:
         self.elem_to_prop = {}
         self.element_centroids = {}  # EID -> (x, y, z) centroid coordinates
         self.bar_to_nearby_skins = {}  # Bar PID -> list of nearby Skin PIDs
+        self.skin_to_nearby_bars = {}  # Skin PID -> list of nearby Bar PIDs (reverse mapping)
 
         # Allowable fits (RF Check v2.1 format)
         self.allowable_interp = {}  # PID -> {a, b, r2, excluded, n_pts}
@@ -241,7 +242,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)', 'Weight-Efficient Bottom-Up')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)', 'Weight-Efficient Bottom-Up', 'Balanced Bottom-Up')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -553,12 +554,23 @@ class ThicknessIterationTool:
 
             self.bar_to_nearby_skins[bar_pid] = nearby_skins
 
+        # Create reverse mapping: skin -> nearby bars
+        self.skin_to_nearby_bars = {}
+        for bar_pid, skins in self.bar_to_nearby_skins.items():
+            for skin_pid in skins:
+                if skin_pid not in self.skin_to_nearby_bars:
+                    self.skin_to_nearby_bars[skin_pid] = set()
+                self.skin_to_nearby_bars[skin_pid].add(bar_pid)
+
         # Log summary
         total_connections = sum(len(skins) for skins in self.bar_to_nearby_skins.values())
         avg_skins = total_connections / len(self.bar_to_nearby_skins) if self.bar_to_nearby_skins else 0
+        avg_bars = sum(len(bars) for bars in self.skin_to_nearby_bars.values()) / len(self.skin_to_nearby_bars) if self.skin_to_nearby_bars else 0
         self.log(f"    Bar properties: {len(self.bar_to_nearby_skins)}")
+        self.log(f"    Skin properties with nearby bars: {len(self.skin_to_nearby_bars)}")
         self.log(f"    Total connections: {total_connections}")
         self.log(f"    Avg skins per bar: {avg_skins:.1f}")
+        self.log(f"    Avg bars per skin: {avg_bars:.1f}")
 
     def load_properties(self):
         path = self.property_excel_path.get()
@@ -1108,6 +1120,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
         elif algo == "Weight-Efficient Bottom-Up":
             threading.Thread(target=self._run_weight_efficient_bottomup, daemon=True).start()
+        elif algo == "Balanced Bottom-Up":
+            threading.Thread(target=self._run_balanced_bottomup, daemon=True).start()
         else:
             threading.Thread(target=self._run_simple_iterative, daemon=True).start()
 
@@ -3277,10 +3291,23 @@ class ThicknessIterationTool:
                         })
 
                 # Analyze SKIN properties
+                # KEY FIX: If skin has no RF data, use nearby bars' RF instead of target_rf
                 for pid in self.skin_properties:
-                    prop_rf = pid_min_rf.get(pid, target_rf)
+                    prop_rf = pid_min_rf.get(pid, None)  # None if no RF data
                     current_t = self.current_skin_thicknesses[pid]
                     sens = weight_sens.get(pid, 0)
+
+                    # If skin has no direct RF data, estimate from nearby bars
+                    if prop_rf is None:
+                        nearby_bars = self.skin_to_nearby_bars.get(pid, [])
+                        nearby_rfs = [pid_min_rf.get(b, None) for b in nearby_bars]
+                        nearby_rfs = [rf for rf in nearby_rfs if rf is not None and rf < 999]
+                        if nearby_rfs:
+                            # Use minimum RF of nearby bars (most critical)
+                            prop_rf = min(nearby_rfs)
+                        else:
+                            # No nearby bar data either - skip this skin
+                            continue
 
                     if prop_rf < target_rf - rf_tol and current_t < skin_max and sens > 0:
                         rf_deficit = target_rf - prop_rf
@@ -3353,26 +3380,40 @@ class ThicknessIterationTool:
                 self.log(f"    Updated: {bar_increased} bars, {skin_increased} skins (by efficiency)")
 
                 # Also handle coupled skins for bars that were increased
-                # But with REDUCED magnitude (skins are expensive)
+                # KEY FIX: If bar fails, also increase nearby skins (they share load)
                 coupled_updates = 0
                 for c in candidates[:n_to_update]:
                     if c['type'] == 'bar':
                         bar_pid = c['pid']
+                        bar_rf = c['rf']
                         nearby_skins = self.bar_to_nearby_skins.get(bar_pid, [])
                         for skin_pid in nearby_skins:
                             if skin_pid in self.current_skin_thicknesses:
-                                skin_rf = pid_min_rf.get(skin_pid, target_rf)
-                                if skin_rf < target_rf - rf_tol:
-                                    current = self.current_skin_thicknesses[skin_pid]
-                                    # Much smaller increase for coupled skins (they're expensive!)
-                                    # Only 5% increase instead of full ratio
-                                    new_t = min(current * 1.05, skin_max)
+                                current = self.current_skin_thicknesses[skin_pid]
+                                if current >= skin_max:
+                                    continue  # Already at max
+
+                                # Get skin RF (use bar RF as proxy if no data)
+                                skin_rf = pid_min_rf.get(skin_pid, None)
+                                if skin_rf is None:
+                                    skin_rf = bar_rf  # Use nearby bar's RF as estimate
+
+                                # If skin or nearby bar is under-designed, increase skin
+                                if skin_rf < target_rf - rf_tol or bar_rf < target_rf - rf_tol:
+                                    # Scale increase by how bad the bar is failing
+                                    # Worse bar RF = larger skin increase
+                                    if bar_rf > 0:
+                                        increase_factor = min(1.15, (target_rf / bar_rf) ** 0.3)
+                                    else:
+                                        increase_factor = 1.15
+
+                                    new_t = min(current * increase_factor, skin_max)
                                     if new_t > current:
                                         self.current_skin_thicknesses[skin_pid] = new_t
                                         coupled_updates += 1
 
                 if coupled_updates > 0:
-                    self.log(f"    Coupled skin updates: {coupled_updates} (reduced magnitude)")
+                    self.log(f"    Coupled skin updates: {coupled_updates} (scaled by bar RF)")
 
                 # Reduce over-designed properties
                 reduced = self._reduce_overdesigned(pid_min_rf, target_rf, rf_tol,
@@ -3412,6 +3453,253 @@ class ThicknessIterationTool:
                     f"Best RF: {self.best_solution['min_rf']:.4f}\n"
                     f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
                     f"Iterations: {iteration}\n"
+                    f"Converged: {'Yes' if converged else 'No'}"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_balanced_bottomup(self):
+        """Algorithm 10: Balanced Bottom-Up - Equal priority for bars AND skins.
+
+        Unlike Weight-Efficient, this algorithm:
+        1. Updates ALL failing properties, not just most efficient ones
+        2. Uses nearby bar RF for skins without direct RF data
+        3. Guarantees minimum increase for any failing property
+
+        Best for: Cases where skin thicknesses also need optimization.
+        """
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: BALANCED BOTTOM-UP")
+            self.log("="*70)
+            self.log("Strategy: Equal priority for bars AND skins")
+            self.log("="*70)
+
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
+
+            # Calculate bar-skin proximity mapping
+            self.calculate_bar_skin_proximity()
+
+            # Create output folder
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"balanced_bottomup_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== PHASE 1: Initialize at MINIMUM thicknesses ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: Initialize at MINIMUM thicknesses")
+            self.log("="*50)
+
+            for pid in self.bar_properties:
+                self.current_bar_thicknesses[pid] = bar_min
+
+            for pid in self.skin_properties:
+                self.current_skin_thicknesses[pid] = skin_min
+
+            self.log(f"  Bar: {len(self.bar_properties)} properties → {bar_min} mm")
+            self.log(f"  Skin: {len(self.skin_properties)} properties → {skin_min} mm")
+
+            # ========== PHASE 2: Iterative Optimization ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: Balanced Iterative Optimization")
+            self.log("="*50)
+
+            best_weight = float('inf')
+            converged = False
+
+            for iteration in range(1, max_iter + 1):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*50}")
+                self.log(f"ITERATION {iteration}/{max_iter}")
+                self.log(f"{'='*50}")
+
+                iter_folder = os.path.join(base_folder, f"iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+
+                self.update_progress((iteration/max_iter)*100, f"Iter {iteration}/{max_iter}")
+
+                # Run Nastran
+                result = self._run_iteration(iter_folder, iteration, target_rf)
+
+                if not result:
+                    self.log("  ERROR: Iteration failed!")
+                    continue
+
+                self.iteration_results.append(result)
+                min_rf = result['min_rf']
+                weight = result['weight']
+                n_fail = result['n_fail']
+
+                # Calculate per-property RF
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid and rf is not None:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                self.log(f"\n  Results: Min RF={min_rf:.4f}, Fails={n_fail}, Weight={weight:.6f}t")
+
+                # Count failing bars and skins separately
+                failing_bars = sum(1 for p in self.bar_properties if pid_min_rf.get(p, target_rf) < target_rf - rf_tol)
+                failing_skins = sum(1 for p in self.skin_properties if pid_min_rf.get(p, target_rf) < target_rf - rf_tol)
+                self.log(f"  Failing: {failing_bars} bars, {failing_skins} skins")
+
+                # Check convergence
+                if min_rf >= target_rf - rf_tol and n_fail == 0:
+                    self.log(f"\n  *** CONVERGED! Min RF ≥ {target_rf - rf_tol:.3f} ***")
+                    converged = True
+                    if weight < best_weight:
+                        best_weight = weight
+                        self.best_solution = result
+                    break
+
+                # Track best feasible
+                if min_rf >= target_rf - rf_tol and weight < best_weight:
+                    best_weight = weight
+                    self.best_solution = result
+                    self.log(f"  *** NEW BEST: Weight={weight:.6f}t ***")
+
+                # ========== BALANCED UPDATE ==========
+                self.log(f"\n  Balanced Update:")
+
+                bar_updated = 0
+                skin_updated = 0
+
+                # Update ALL failing BAR properties
+                for pid in self.bar_properties:
+                    prop_rf = pid_min_rf.get(pid, target_rf)
+                    current_t = self.current_bar_thicknesses[pid]
+
+                    if prop_rf < target_rf - rf_tol and current_t < bar_max:
+                        # Calculate increase based on RF deficit
+                        if prop_rf > 0:
+                            ratio = (target_rf / prop_rf) ** 0.5
+                            ratio = min(ratio, 1.5)  # Max 50% increase
+                        else:
+                            ratio = 1.5
+
+                        new_t = current_t * ratio
+
+                        # Ensure minimum step
+                        if new_t - current_t < step:
+                            new_t = current_t + step
+
+                        new_t = min(new_t, bar_max)
+                        self.current_bar_thicknesses[pid] = new_t
+                        bar_updated += 1
+
+                # Update SKIN properties - with special handling for no-RF cases
+                for pid in self.skin_properties:
+                    current_t = self.current_skin_thicknesses[pid]
+
+                    if current_t >= skin_max:
+                        continue  # Already at max
+
+                    # Get skin RF (direct or estimated)
+                    prop_rf = pid_min_rf.get(pid, None)
+
+                    # If no direct RF, estimate from nearby bars
+                    if prop_rf is None:
+                        nearby_bars = self.skin_to_nearby_bars.get(pid, set())
+                        nearby_rfs = [pid_min_rf.get(b, None) for b in nearby_bars]
+                        nearby_rfs = [rf for rf in nearby_rfs if rf is not None and 0 < rf < 999]
+                        if nearby_rfs:
+                            prop_rf = min(nearby_rfs)  # Use most critical nearby bar
+                        else:
+                            prop_rf = target_rf  # No data - assume OK
+
+                    # Update if failing
+                    if prop_rf < target_rf - rf_tol:
+                        if prop_rf > 0:
+                            ratio = (target_rf / prop_rf) ** 0.5
+                            ratio = min(ratio, 1.5)
+                        else:
+                            ratio = 1.5
+
+                        new_t = current_t * ratio
+
+                        # Ensure minimum step
+                        if new_t - current_t < step:
+                            new_t = current_t + step
+
+                        new_t = min(new_t, skin_max)
+                        self.current_skin_thicknesses[pid] = new_t
+                        skin_updated += 1
+
+                self.log(f"    Updated: {bar_updated} bars, {skin_updated} skins")
+
+                # Log thickness ranges
+                bar_ts = list(self.current_bar_thicknesses.values())
+                skin_ts = list(self.current_skin_thicknesses.values())
+                if bar_ts:
+                    self.log(f"    Bar thickness range: {min(bar_ts):.2f} - {max(bar_ts):.2f} mm")
+                if skin_ts:
+                    self.log(f"    Skin thickness range: {min(skin_ts):.2f} - {max(skin_ts):.2f} mm")
+
+                # Reduce over-designed
+                reduced = self._reduce_overdesigned(pid_min_rf, target_rf, rf_tol,
+                                                    bar_min, bar_max, skin_min, skin_max)
+                if reduced > 0:
+                    self.log(f"    Reduced over-designed: {reduced}")
+
+            # ========== FINAL RESULTS ==========
+            self.log("\n" + "="*70)
+            self.log("BALANCED BOTTOM-UP COMPLETE")
+            self.log("="*70)
+
+            if self.best_solution:
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {self.best_solution['min_rf']:.4f}")
+                self.log(f"  Weight: {self.best_solution['weight']:.6f} tonnes")
+                self.log(f"  Converged: {'Yes' if converged else 'No'}")
+
+                # Log final thickness summary
+                bar_ts = list(self.best_solution['bar_thicknesses'].values())
+                skin_ts = list(self.best_solution.get('skin_thicknesses', {}).values())
+                if bar_ts:
+                    self.log(f"  Bar thicknesses: {min(bar_ts):.2f} - {max(bar_ts):.2f} mm (avg: {sum(bar_ts)/len(bar_ts):.2f})")
+                if skin_ts:
+                    self.log(f"  Skin thicknesses: {min(skin_ts):.2f} - {max(skin_ts):.2f} mm (avg: {sum(skin_ts)/len(skin_ts):.2f})")
+
+                self._generate_final_report(base_folder, "Balanced Bottom-Up",
+                    nastran_count=iteration,
+                    extra_info={
+                        "Strategy": "Equal priority for bars AND skins",
+                        "Start": "Minimum thicknesses",
+                        "Converged": "Yes" if converged else "No"
+                    })
+
+                self.root.after(0, lambda: self.result_summary.config(
+                    text=f"Best: Weight={self.best_solution['weight']:.6f}t, RF={self.best_solution['min_rf']:.4f}",
+                    foreground="green"
+                ))
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Balanced Bottom-Up Complete",
+                    f"Optimization Complete!\n\n"
+                    f"Best RF: {self.best_solution['min_rf']:.4f}\n"
+                    f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
                     f"Converged: {'Yes' if converged else 'No'}"
                 ))
             else:
