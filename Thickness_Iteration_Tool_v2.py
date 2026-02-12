@@ -242,7 +242,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)', 'Weight-Efficient Bottom-Up', 'Balanced Bottom-Up')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)', 'Weight-Efficient Bottom-Up', 'Balanced Bottom-Up', 'Adaptive Coupled')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -1122,6 +1122,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_weight_efficient_bottomup, daemon=True).start()
         elif algo == "Balanced Bottom-Up":
             threading.Thread(target=self._run_balanced_bottomup, daemon=True).start()
+        elif algo == "Adaptive Coupled":
+            threading.Thread(target=self._run_adaptive_coupled, daemon=True).start()
         else:
             threading.Thread(target=self._run_simple_iterative, daemon=True).start()
 
@@ -3701,6 +3703,352 @@ class ThicknessIterationTool:
                     f"Best RF: {self.best_solution['min_rf']:.4f}\n"
                     f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
                     f"Converged: {'Yes' if converged else 'No'}"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_adaptive_coupled(self):
+        """Algorithm 11: Adaptive Coupled Optimization - Learns bar-skin interaction.
+
+        This algorithm understands that bars and skins share load:
+        - When bar thickness increases → bar takes more load → skin stress may decrease
+        - The algorithm LEARNS this coupling from iteration history
+
+        Strategy:
+        1. Track RF changes for both bars AND skins after each update
+        2. Calculate effective sensitivity: ΔRF / ΔWeight
+        3. Adaptively choose: increase bars, skins, or both based on learned coupling
+
+        Best for: Coupled bar-skin structures where optimal weight requires understanding
+        the load sharing between components.
+        """
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: ADAPTIVE COUPLED OPTIMIZATION")
+            self.log("="*70)
+            self.log("Strategy: Learn bar-skin coupling, optimize for minimum weight")
+            self.log("="*70)
+
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
+
+            self.calculate_bar_skin_proximity()
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"adaptive_coupled_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== LEARNING PARAMETERS ==========
+            # Track history to learn sensitivities
+            history = []  # [{bar_delta_weight, skin_delta_weight, delta_min_rf, bar_rf_change, skin_rf_change}]
+
+            # Learned sensitivities (updated each iteration)
+            bar_rf_sensitivity = 1.0   # RF gain per unit bar weight
+            skin_rf_sensitivity = 1.0  # RF gain per unit skin weight
+            coupling_factor = 0.5      # How much bar changes affect skin RF
+
+            # Calculate weight sensitivities (static - geometry based)
+            weight_sens = self._calculate_weight_sensitivities()
+            avg_bar_sens = sum(weight_sens.get(p, 0) for p in self.bar_properties) / max(len(self.bar_properties), 1)
+            avg_skin_sens = sum(weight_sens.get(p, 0) for p in self.skin_properties) / max(len(self.skin_properties), 1)
+
+            self.log(f"\n  Weight Sensitivities:")
+            self.log(f"    Avg bar: {avg_bar_sens:.6f} t/mm")
+            self.log(f"    Avg skin: {avg_skin_sens:.6f} t/mm")
+            if avg_bar_sens > 0:
+                self.log(f"    Skin/Bar ratio: {avg_skin_sens/avg_bar_sens:.1f}x")
+
+            # ========== PHASE 1: Initialize ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: Initialize at MINIMUM")
+            self.log("="*50)
+
+            for pid in self.bar_properties:
+                self.current_bar_thicknesses[pid] = bar_min
+            for pid in self.skin_properties:
+                self.current_skin_thicknesses[pid] = skin_min
+
+            # ========== PHASE 2: Adaptive Iteration ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: Adaptive Coupled Optimization")
+            self.log("="*50)
+
+            best_weight = float('inf')
+            converged = False
+            prev_result = None
+            prev_bar_weight = sum(self.current_bar_thicknesses.values())
+            prev_skin_weight = sum(self.current_skin_thicknesses.values())
+
+            for iteration in range(1, max_iter + 1):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*50}")
+                self.log(f"ITERATION {iteration}/{max_iter}")
+                self.log(f"{'='*50}")
+
+                iter_folder = os.path.join(base_folder, f"iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+                self.update_progress((iteration/max_iter)*100, f"Iter {iteration}/{max_iter}")
+
+                # Run Nastran
+                result = self._run_iteration(iter_folder, iteration, target_rf)
+                if not result:
+                    continue
+
+                self.iteration_results.append(result)
+                min_rf = result['min_rf']
+                weight = result['weight']
+                n_fail = result['n_fail']
+
+                # Calculate per-property RF
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid and rf is not None:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                # Calculate average RF for bars and skins
+                bar_rfs = [pid_min_rf.get(p, target_rf) for p in self.bar_properties if pid_min_rf.get(p, 999) < 999]
+                skin_rfs = [pid_min_rf.get(p, target_rf) for p in self.skin_properties if pid_min_rf.get(p, 999) < 999]
+                avg_bar_rf = sum(bar_rfs) / len(bar_rfs) if bar_rfs else target_rf
+                avg_skin_rf = sum(skin_rfs) / len(skin_rfs) if skin_rfs else target_rf
+                min_bar_rf = min(bar_rfs) if bar_rfs else target_rf
+                min_skin_rf = min(skin_rfs) if skin_rfs else target_rf
+
+                self.log(f"\n  Results:")
+                self.log(f"    Min RF: {min_rf:.4f}, Fails: {n_fail}, Weight: {weight:.6f}t")
+                self.log(f"    Bar RF:  min={min_bar_rf:.3f}, avg={avg_bar_rf:.3f}")
+                self.log(f"    Skin RF: min={min_skin_rf:.3f}, avg={avg_skin_rf:.3f}")
+
+                # ========== LEARN FROM HISTORY ==========
+                if prev_result is not None:
+                    curr_bar_weight = sum(self.current_bar_thicknesses.values())
+                    curr_skin_weight = sum(self.current_skin_thicknesses.values())
+
+                    delta_bar_weight = curr_bar_weight - prev_bar_weight
+                    delta_skin_weight = curr_skin_weight - prev_skin_weight
+                    delta_rf = min_rf - prev_result['min_rf']
+
+                    # Record history
+                    history.append({
+                        'iter': iteration,
+                        'delta_bar_weight': delta_bar_weight,
+                        'delta_skin_weight': delta_skin_weight,
+                        'delta_rf': delta_rf,
+                        'min_rf': min_rf
+                    })
+
+                    # Update learned sensitivities (exponential moving average)
+                    alpha = 0.3  # Learning rate
+                    if abs(delta_bar_weight) > 0.01:
+                        new_bar_sens = delta_rf / delta_bar_weight if delta_bar_weight != 0 else 0
+                        bar_rf_sensitivity = alpha * new_bar_sens + (1 - alpha) * bar_rf_sensitivity
+
+                    if abs(delta_skin_weight) > 0.01:
+                        new_skin_sens = delta_rf / delta_skin_weight if delta_skin_weight != 0 else 0
+                        skin_rf_sensitivity = alpha * new_skin_sens + (1 - alpha) * skin_rf_sensitivity
+
+                    self.log(f"\n  Learned Sensitivities (ΔRF/ΔWeight):")
+                    self.log(f"    Bar: {bar_rf_sensitivity:.4f}")
+                    self.log(f"    Skin: {skin_rf_sensitivity:.4f}")
+
+                    prev_bar_weight = curr_bar_weight
+                    prev_skin_weight = curr_skin_weight
+
+                # Check convergence
+                if min_rf >= target_rf - rf_tol and n_fail == 0:
+                    self.log(f"\n  *** CONVERGED! ***")
+                    converged = True
+                    if weight < best_weight:
+                        best_weight = weight
+                        self.best_solution = result
+                    break
+
+                if min_rf >= target_rf - rf_tol and weight < best_weight:
+                    best_weight = weight
+                    self.best_solution = result
+
+                # ========== ADAPTIVE UPDATE STRATEGY ==========
+                self.log(f"\n  Adaptive Update Strategy:")
+
+                # Decide strategy based on learned sensitivities and current state
+                # Effective efficiency = RF_sensitivity / Weight_sensitivity
+                bar_efficiency = bar_rf_sensitivity / avg_bar_sens if avg_bar_sens > 0 else 0
+                skin_efficiency = skin_rf_sensitivity / avg_skin_sens if avg_skin_sens > 0 else 0
+
+                self.log(f"    Bar efficiency (ΔRF/ΔCost): {bar_efficiency:.4f}")
+                self.log(f"    Skin efficiency (ΔRF/ΔCost): {skin_efficiency:.4f}")
+
+                # Count what needs updating
+                failing_bars = [(p, pid_min_rf.get(p, target_rf)) for p in self.bar_properties
+                               if pid_min_rf.get(p, target_rf) < target_rf - rf_tol
+                               and self.current_bar_thicknesses[p] < bar_max]
+                failing_skins = [(p, pid_min_rf.get(p, target_rf)) for p in self.skin_properties
+                                if pid_min_rf.get(p, target_rf) < target_rf - rf_tol
+                                and self.current_skin_thicknesses[p] < skin_max]
+
+                # Also check skins near failing bars (coupling effect)
+                skins_near_failing_bars = set()
+                for bar_pid, bar_rf in failing_bars:
+                    for skin_pid in self.bar_to_nearby_skins.get(bar_pid, set()):
+                        if self.current_skin_thicknesses.get(skin_pid, skin_max) < skin_max:
+                            skins_near_failing_bars.add(skin_pid)
+
+                self.log(f"    Failing bars: {len(failing_bars)}")
+                self.log(f"    Failing skins: {len(failing_skins)}")
+                self.log(f"    Skins near failing bars: {len(skins_near_failing_bars)}")
+
+                # Adaptive strategy decision
+                bar_updates = 0
+                skin_updates = 0
+
+                # Strategy 1: If bar efficiency >> skin efficiency, focus on bars
+                # Strategy 2: If skin efficiency >> bar efficiency, focus on skins
+                # Strategy 3: If similar, update both proportionally
+
+                efficiency_ratio = bar_efficiency / skin_efficiency if skin_efficiency > 0.001 else 10
+
+                if efficiency_ratio > 2:
+                    strategy = "BAR_FOCUS"
+                    bar_increase_factor = 1.3
+                    skin_increase_factor = 1.05
+                elif efficiency_ratio < 0.5:
+                    strategy = "SKIN_FOCUS"
+                    bar_increase_factor = 1.05
+                    skin_increase_factor = 1.3
+                else:
+                    strategy = "BALANCED"
+                    bar_increase_factor = 1.15
+                    skin_increase_factor = 1.15
+
+                self.log(f"    Strategy: {strategy} (efficiency ratio: {efficiency_ratio:.2f})")
+
+                # Update BARS
+                for bar_pid, bar_rf in failing_bars:
+                    current_t = self.current_bar_thicknesses[bar_pid]
+                    if bar_rf > 0:
+                        rf_ratio = (target_rf / bar_rf) ** 0.4
+                        rf_ratio = min(rf_ratio, bar_increase_factor)
+                    else:
+                        rf_ratio = bar_increase_factor
+
+                    new_t = current_t * rf_ratio
+                    if new_t - current_t < step:
+                        new_t = current_t + step
+                    new_t = min(new_t, bar_max)
+                    self.current_bar_thicknesses[bar_pid] = new_t
+                    bar_updates += 1
+
+                # Update SKINS - both failing and those near failing bars
+                skins_to_update = set(p for p, _ in failing_skins) | skins_near_failing_bars
+                for skin_pid in skins_to_update:
+                    current_t = self.current_skin_thicknesses.get(skin_pid, skin_min)
+                    if current_t >= skin_max:
+                        continue
+
+                    # Get skin RF (direct or from nearby bars)
+                    skin_rf = pid_min_rf.get(skin_pid, None)
+                    if skin_rf is None:
+                        nearby_bars = self.skin_to_nearby_bars.get(skin_pid, set())
+                        nearby_rfs = [pid_min_rf.get(b, target_rf) for b in nearby_bars]
+                        nearby_rfs = [rf for rf in nearby_rfs if rf < 999]
+                        skin_rf = min(nearby_rfs) if nearby_rfs else target_rf
+
+                    if skin_rf < target_rf - rf_tol:
+                        if skin_rf > 0:
+                            rf_ratio = (target_rf / skin_rf) ** 0.4
+                            rf_ratio = min(rf_ratio, skin_increase_factor)
+                        else:
+                            rf_ratio = skin_increase_factor
+
+                        new_t = current_t * rf_ratio
+                        if new_t - current_t < step * 0.5:
+                            new_t = current_t + step * 0.5
+                        new_t = min(new_t, skin_max)
+                        self.current_skin_thicknesses[skin_pid] = new_t
+                        skin_updates += 1
+
+                self.log(f"    Updated: {bar_updates} bars, {skin_updates} skins")
+
+                # Log current state
+                bar_ts = list(self.current_bar_thicknesses.values())
+                skin_ts = list(self.current_skin_thicknesses.values())
+                self.log(f"    Bar range: {min(bar_ts):.2f} - {max(bar_ts):.2f} mm")
+                self.log(f"    Skin range: {min(skin_ts):.2f} - {max(skin_ts):.2f} mm")
+
+                # Reduce over-designed
+                reduced = self._reduce_overdesigned(pid_min_rf, target_rf, rf_tol,
+                                                    bar_min, bar_max, skin_min, skin_max)
+                if reduced > 0:
+                    self.log(f"    Reduced over-designed: {reduced}")
+
+                prev_result = result
+
+            # ========== FINAL RESULTS ==========
+            self.log("\n" + "="*70)
+            self.log("ADAPTIVE COUPLED OPTIMIZATION COMPLETE")
+            self.log("="*70)
+
+            # Log learned parameters
+            self.log(f"\nLearned Parameters:")
+            self.log(f"  Final Bar RF Sensitivity: {bar_rf_sensitivity:.4f}")
+            self.log(f"  Final Skin RF Sensitivity: {skin_rf_sensitivity:.4f}")
+
+            if self.best_solution:
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {self.best_solution['min_rf']:.4f}")
+                self.log(f"  Weight: {self.best_solution['weight']:.6f} tonnes")
+                self.log(f"  Converged: {'Yes' if converged else 'No'}")
+
+                bar_ts = list(self.best_solution['bar_thicknesses'].values())
+                skin_ts = list(self.best_solution.get('skin_thicknesses', {}).values())
+                if bar_ts:
+                    self.log(f"  Bar: {min(bar_ts):.2f} - {max(bar_ts):.2f} mm (avg: {sum(bar_ts)/len(bar_ts):.2f})")
+                if skin_ts:
+                    self.log(f"  Skin: {min(skin_ts):.2f} - {max(skin_ts):.2f} mm (avg: {sum(skin_ts)/len(skin_ts):.2f})")
+
+                self._generate_final_report(base_folder, "Adaptive Coupled",
+                    nastran_count=iteration,
+                    extra_info={
+                        "Strategy": "Learned bar-skin coupling",
+                        "Final Bar Sensitivity": f"{bar_rf_sensitivity:.4f}",
+                        "Final Skin Sensitivity": f"{skin_rf_sensitivity:.4f}",
+                        "Converged": "Yes" if converged else "No"
+                    })
+
+                self.root.after(0, lambda: self.result_summary.config(
+                    text=f"Best: Weight={self.best_solution['weight']:.6f}t, RF={self.best_solution['min_rf']:.4f}",
+                    foreground="green"
+                ))
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Adaptive Coupled Complete",
+                    f"Optimization Complete!\n\n"
+                    f"Best RF: {self.best_solution['min_rf']:.4f}\n"
+                    f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
+                    f"Converged: {'Yes' if converged else 'No'}\n\n"
+                    f"Learned Sensitivities:\n"
+                    f"  Bar: {bar_rf_sensitivity:.4f}\n"
+                    f"  Skin: {skin_rf_sensitivity:.4f}"
                 ))
             else:
                 self.log("ERROR: No feasible solution found!")
