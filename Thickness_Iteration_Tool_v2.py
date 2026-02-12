@@ -241,7 +241,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)')
+        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)', 'Weight-Efficient Bottom-Up')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -1106,6 +1106,8 @@ class ThicknessIterationTool:
             threading.Thread(target=self._run_topdown_algorithm, daemon=True).start()
         elif algo == "Bottom-Up (Min to Target)":
             threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
+        elif algo == "Weight-Efficient Bottom-Up":
+            threading.Thread(target=self._run_weight_efficient_bottomup, daemon=True).start()
         else:
             threading.Thread(target=self._run_simple_iterative, daemon=True).start()
 
@@ -3105,6 +3107,355 @@ class ThicknessIterationTool:
             self.is_running = False
             self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
 
+    def _run_weight_efficient_bottomup(self):
+        """Algorithm 9: Weight-Efficient Bottom-Up - Prioritize lowest weight-cost strengthening.
+
+        Key insight: Different properties have different weight costs per thickness increase.
+        - Skin with large area: high weight cost (dW/dt = Area × density)
+        - Bar with small cross-section: low weight cost (dW/dt = Length × dim2 × density)
+
+        Strategy: When RF < target, increase the property with BEST efficiency:
+            Efficiency = RF_deficit / weight_sensitivity
+
+        This ensures minimum weight solution by always choosing the cheapest fix.
+        """
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: WEIGHT-EFFICIENT BOTTOM-UP")
+            self.log("="*70)
+            self.log("Strategy: Prioritize strengthening by weight efficiency (ΔRF/ΔWeight)")
+            self.log("="*70)
+
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
+
+            # Calculate bar-skin proximity mapping
+            self.calculate_bar_skin_proximity()
+
+            # Create output folder
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"weight_efficient_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== PHASE 1: Initialize at MINIMUM thicknesses ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: Initialize thicknesses at MINIMUM")
+            self.log("="*50)
+
+            for pid in self.bar_properties:
+                self.current_bar_thicknesses[pid] = bar_min
+
+            for pid in self.skin_properties:
+                self.current_skin_thicknesses[pid] = skin_min
+
+            self.log(f"  Bar thicknesses: {len(self.bar_properties)} properties → MIN ({bar_min})")
+            self.log(f"  Skin thicknesses: {len(self.skin_properties)} properties → MIN ({skin_min})")
+
+            # ========== PHASE 2: Calculate Weight Sensitivities ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: Calculate Weight Sensitivities")
+            self.log("="*50)
+
+            weight_sens = self._calculate_weight_sensitivities()
+
+            # Log sensitivity comparison
+            bar_sens_list = [(pid, weight_sens.get(pid, 0)) for pid in self.bar_properties]
+            skin_sens_list = [(pid, weight_sens.get(pid, 0)) for pid in self.skin_properties]
+
+            if bar_sens_list:
+                avg_bar_sens = sum(s for _, s in bar_sens_list) / len(bar_sens_list)
+                self.log(f"  Bar avg weight sensitivity: {avg_bar_sens:.6f} tonnes/mm")
+            if skin_sens_list:
+                avg_skin_sens = sum(s for _, s in skin_sens_list) / len(skin_sens_list)
+                self.log(f"  Skin avg weight sensitivity: {avg_skin_sens:.6f} tonnes/mm")
+
+            if bar_sens_list and skin_sens_list and avg_bar_sens > 0:
+                ratio = avg_skin_sens / avg_bar_sens
+                self.log(f"  Skin/Bar sensitivity ratio: {ratio:.1f}x")
+                self.log(f"  → Increasing bar thickness is {ratio:.1f}x more weight-efficient!")
+
+            # ========== PHASE 3: Weight-Efficient Iterative Strengthening ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 3: Weight-Efficient Iterative Strengthening")
+            self.log("="*50)
+
+            best_weight = float('inf')
+            converged = False
+
+            for iteration in range(1, max_iter + 1):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*50}")
+                self.log(f"ITERATION {iteration}/{max_iter}")
+                self.log(f"{'='*50}")
+
+                iter_folder = os.path.join(base_folder, f"iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+
+                self.update_progress((iteration/max_iter)*100, f"Iter {iteration}/{max_iter}")
+
+                # Run Nastran and get RF
+                result = self._run_iteration(iter_folder, iteration, target_rf)
+
+                if not result:
+                    self.log("  ERROR: Iteration failed!")
+                    continue
+
+                self.iteration_results.append(result)
+                min_rf = result['min_rf']
+                weight = result['weight']
+                n_fail = result['n_fail']
+
+                self.log(f"\n  Summary: Min RF={min_rf:.4f}, Fails={n_fail}, Weight={weight:.6f}t")
+
+                # Calculate per-property RF
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                # Check convergence
+                all_converged = True
+                for pid, rf in pid_min_rf.items():
+                    if rf < target_rf - rf_tol:
+                        all_converged = False
+                        break
+
+                if all_converged and min_rf >= target_rf - rf_tol:
+                    self.log(f"\n  *** CONVERGED! All properties have RF ≥ {target_rf - rf_tol:.3f} ***")
+                    converged = True
+                    if weight < best_weight:
+                        best_weight = weight
+                        self.best_solution = result
+                    break
+
+                # Track best feasible solution
+                if min_rf >= target_rf - rf_tol and weight < best_weight:
+                    best_weight = weight
+                    self.best_solution = result
+                    self.log(f"  *** NEW BEST: Weight={weight:.6f}t ***")
+
+                # ========== WEIGHT-EFFICIENT UPDATE ==========
+                # Calculate efficiency for each under-designed property
+                # Efficiency = RF_deficit / weight_sensitivity (higher = better to increase)
+
+                self.log(f"\n  Weight-Efficient Update Analysis:")
+
+                candidates = []  # [(pid, type, efficiency, rf_deficit, current_t, max_t)]
+
+                # Analyze BAR properties
+                for pid in self.bar_properties:
+                    prop_rf = pid_min_rf.get(pid, target_rf)
+                    current_t = self.current_bar_thicknesses[pid]
+                    sens = weight_sens.get(pid, 0)
+
+                    if prop_rf < target_rf - rf_tol and current_t < bar_max and sens > 0:
+                        rf_deficit = target_rf - prop_rf
+                        # Efficiency: how much RF we need per unit weight cost
+                        # Higher efficiency = this property gives more RF bang for weight buck
+                        efficiency = rf_deficit / sens
+                        candidates.append({
+                            'pid': pid,
+                            'type': 'bar',
+                            'efficiency': efficiency,
+                            'rf_deficit': rf_deficit,
+                            'rf': prop_rf,
+                            'current_t': current_t,
+                            'max_t': bar_max,
+                            'sens': sens
+                        })
+
+                # Analyze SKIN properties
+                for pid in self.skin_properties:
+                    prop_rf = pid_min_rf.get(pid, target_rf)
+                    current_t = self.current_skin_thicknesses[pid]
+                    sens = weight_sens.get(pid, 0)
+
+                    if prop_rf < target_rf - rf_tol and current_t < skin_max and sens > 0:
+                        rf_deficit = target_rf - prop_rf
+                        efficiency = rf_deficit / sens
+                        candidates.append({
+                            'pid': pid,
+                            'type': 'skin',
+                            'efficiency': efficiency,
+                            'rf_deficit': rf_deficit,
+                            'rf': prop_rf,
+                            'current_t': current_t,
+                            'max_t': skin_max,
+                            'sens': sens
+                        })
+
+                if not candidates:
+                    self.log("    No properties need strengthening or all at max thickness.")
+                    # Try reducing over-designed properties
+                    self._reduce_overdesigned(pid_min_rf, target_rf, rf_tol,
+                                              bar_min, bar_max, skin_min, skin_max)
+                    continue
+
+                # Sort by efficiency (descending - highest efficiency first)
+                candidates.sort(key=lambda x: x['efficiency'], reverse=True)
+
+                # Log top candidates
+                self.log(f"    Top efficiency candidates (higher = better to increase):")
+                for i, c in enumerate(candidates[:5]):
+                    self.log(f"      {i+1}. PID {c['pid']} ({c['type']}): "
+                             f"eff={c['efficiency']:.2e}, RF={c['rf']:.3f}, "
+                             f"sens={c['sens']:.6f} t/mm")
+
+                # Strategy: Increase properties with highest efficiency
+                # But limit how many we increase per iteration for stability
+                n_to_update = min(len(candidates), max(3, len(candidates) // 3))
+
+                bar_increased = 0
+                skin_increased = 0
+
+                for c in candidates[:n_to_update]:
+                    pid = c['pid']
+                    current_t = c['current_t']
+                    max_t = c['max_t']
+                    rf_deficit = c['rf_deficit']
+
+                    # Calculate increase amount based on stress ratio
+                    # Use larger steps for higher efficiency properties
+                    alpha = 0.5
+                    if c['rf'] > 0:
+                        ratio = (target_rf / c['rf']) ** alpha
+                        ratio = min(ratio, 1.3)  # Max 30% increase
+                    else:
+                        ratio = 1.3
+
+                    new_t = current_t * ratio
+
+                    # Also ensure minimum step
+                    if new_t - current_t < step * 0.5:
+                        new_t = current_t + step * 0.5
+
+                    new_t = min(new_t, max_t)
+
+                    if c['type'] == 'bar':
+                        self.current_bar_thicknesses[pid] = new_t
+                        bar_increased += 1
+                    else:
+                        self.current_skin_thicknesses[pid] = new_t
+                        skin_increased += 1
+
+                self.log(f"    Updated: {bar_increased} bars, {skin_increased} skins (by efficiency)")
+
+                # Also handle coupled skins for bars that were increased
+                # But with REDUCED magnitude (skins are expensive)
+                coupled_updates = 0
+                for c in candidates[:n_to_update]:
+                    if c['type'] == 'bar':
+                        bar_pid = c['pid']
+                        nearby_skins = self.bar_to_nearby_skins.get(bar_pid, [])
+                        for skin_pid in nearby_skins:
+                            if skin_pid in self.current_skin_thicknesses:
+                                skin_rf = pid_min_rf.get(skin_pid, target_rf)
+                                if skin_rf < target_rf - rf_tol:
+                                    current = self.current_skin_thicknesses[skin_pid]
+                                    # Much smaller increase for coupled skins (they're expensive!)
+                                    # Only 5% increase instead of full ratio
+                                    new_t = min(current * 1.05, skin_max)
+                                    if new_t > current:
+                                        self.current_skin_thicknesses[skin_pid] = new_t
+                                        coupled_updates += 1
+
+                if coupled_updates > 0:
+                    self.log(f"    Coupled skin updates: {coupled_updates} (reduced magnitude)")
+
+                # Reduce over-designed properties
+                reduced = self._reduce_overdesigned(pid_min_rf, target_rf, rf_tol,
+                                                    bar_min, bar_max, skin_min, skin_max)
+                if reduced > 0:
+                    self.log(f"    Reduced over-designed: {reduced} properties")
+
+            # ========== FINAL RESULTS ==========
+            self.log("\n" + "="*70)
+            self.log("WEIGHT-EFFICIENT BOTTOM-UP COMPLETE")
+            self.log("="*70)
+
+            if self.best_solution:
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {self.best_solution['min_rf']:.4f}")
+                self.log(f"  Weight: {self.best_solution['weight']:.6f} tonnes")
+                self.log(f"  Found at iteration: {self.best_solution['iteration']}")
+                self.log(f"  Converged: {'Yes' if converged else 'No'}")
+
+                self._generate_final_report(base_folder, "Weight-Efficient Bottom-Up",
+                    nastran_count=iteration,
+                    extra_info={
+                        "Strategy": "Weight-Sensitivity Based Optimization",
+                        "Start": "Minimum thicknesses",
+                        "Converged": "Yes" if converged else "No",
+                        "Final Iterations": iteration
+                    })
+
+                self.root.after(0, lambda: self.result_summary.config(
+                    text=f"Best: Weight={self.best_solution['weight']:.6f}t, RF={self.best_solution['min_rf']:.4f}",
+                    foreground="green"
+                ))
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Weight-Efficient Complete",
+                    f"Optimization Complete!\n\n"
+                    f"Best RF: {self.best_solution['min_rf']:.4f}\n"
+                    f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
+                    f"Iterations: {iteration}\n"
+                    f"Converged: {'Yes' if converged else 'No'}"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _reduce_overdesigned(self, pid_min_rf, target_rf, rf_tol, bar_min, bar_max, skin_min, skin_max):
+        """Reduce thickness of over-designed properties to save weight."""
+        reduced_count = 0
+        reduce_threshold = target_rf + rf_tol + 0.1  # Only reduce if RF significantly above target
+
+        for pid in self.bar_properties:
+            prop_rf = pid_min_rf.get(pid, 0)
+            if prop_rf > reduce_threshold:
+                current = self.current_bar_thicknesses[pid]
+                # Reduce proportionally but conservatively
+                ratio = (target_rf / prop_rf) ** 0.3  # Small exponent for stability
+                ratio = max(ratio, 0.85)  # Max 15% reduction
+                new_t = max(current * ratio, bar_min)
+                if new_t < current:
+                    self.current_bar_thicknesses[pid] = new_t
+                    reduced_count += 1
+
+        for pid in self.skin_properties:
+            prop_rf = pid_min_rf.get(pid, 0)
+            if prop_rf > reduce_threshold:
+                current = self.current_skin_thicknesses[pid]
+                ratio = (target_rf / prop_rf) ** 0.3
+                ratio = max(ratio, 0.85)
+                new_t = max(current * ratio, skin_min)
+                if new_t < current:
+                    self.current_skin_thicknesses[pid] = new_t
+                    reduced_count += 1
+
+        return reduced_count
+
     def _latin_hypercube_sampling(self, n_samples, n_vars, bounds_low, bounds_high):
         """Generate Latin Hypercube Samples."""
         samples = []
@@ -4117,6 +4468,44 @@ class ThicknessIterationTool:
                 weight += length * dim1 * dim2 * rho
 
         return weight
+
+    def _calculate_weight_sensitivities(self):
+        """Calculate weight sensitivity (dW/dt) for each property.
+
+        Returns dict: {pid: dW/dt} where dW/dt is weight change per unit thickness change.
+
+        For bars: dW/dt = total_length × dim2 × density
+        For skins: dW/dt = total_area × density
+
+        This tells us how much weight we add per mm of thickness increase.
+        """
+        sensitivities = {}
+
+        # Skin properties: dW/dt = total_area × density
+        for pid in self.skin_properties:
+            rho = self.get_density(pid)
+            if pid in self.prop_elements:
+                total_area = sum(self.element_areas.get(eid, 0) for eid in self.prop_elements[pid])
+                sensitivities[pid] = total_area * rho
+            else:
+                sensitivities[pid] = 0
+
+        # Bar properties: dW/dt = total_length × dim2 × density
+        for pid in self.bar_properties:
+            # dim2 is the non-optimized dimension (stays constant)
+            if pid in self.pbarl_dims:
+                dim2 = self.pbarl_dims[pid]['dim2']
+            else:
+                dim2 = self.bar_properties[pid].get('dim2', 1.0)
+
+            rho = self.get_density(pid)
+            if pid in self.prop_elements:
+                total_length = sum(self.bar_lengths.get(eid, 0) for eid in self.prop_elements[pid])
+                sensitivities[pid] = total_length * dim2 * rho
+            else:
+                sensitivities[pid] = 0
+
+        return sensitivities
 
     def _smart_thickness_update(self, result, step, bar_min, bar_max, skin_min, skin_max, target_rf, rf_tol):
         """Per-property smart thickness update based on RF sensitivity."""
