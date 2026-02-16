@@ -242,7 +242,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Bottom-Up (Min to Target)', 'Decoupled Min Weight')
+        algo_combo['values'] = ('Bottom-Up (Min to Target)', 'Decoupled Min Weight', 'Coupled Efficiency Analysis')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -1101,6 +1101,8 @@ class ThicknessIterationTool:
         algo = self.algorithm_var.get()
         if algo == 'Decoupled Min Weight':
             threading.Thread(target=self._run_decoupled_min_weight, daemon=True).start()
+        elif algo == 'Coupled Efficiency Analysis':
+            threading.Thread(target=self._run_coupled_efficiency_analysis, daemon=True).start()
         else:
             # Default: Bottom-Up (Min to Target)
             threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
@@ -4029,6 +4031,460 @@ class ThicknessIterationTool:
                     f"Phase 1 (bars): {phase1_iterations} iters\n"
                     f"Phase 2 (skins): {phase2_iterations} iters\n"
                     f"Total: {total_iterations} iterations"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_coupled_efficiency_analysis(self):
+        """Algorithm: Coupled Efficiency Analysis - Finds optimal bar-skin thickness combination.
+
+        This algorithm analyzes the RF vs Weight trade-off between bar and skin:
+        - Skin panel carries load from bar (coupled system)
+        - When bar thickens, it takes more load, skin stress may decrease
+        - When skin thickens, it takes more load, bar stress may decrease
+
+        Strategy:
+        1. Start at minimum thicknesses
+        2. Each iteration: Test efficiency of bar vs skin increase
+        3. Calculate: Efficiency = ΔRF / ΔWeight (RF gain per unit weight)
+        4. Choose the more efficient option
+        5. Build Pareto front (RF vs Weight)
+        6. Find optimal combination where efficiency drops significantly
+
+        Output:
+        - Efficiency history for bars and skins
+        - RF vs Weight Pareto front
+        - Optimal point recommendation
+        """
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: COUPLED EFFICIENCY ANALYSIS")
+            self.log("="*70)
+            self.log("Strategy: Compare bar vs skin efficiency (ΔRF/ΔWeight) each iteration")
+            self.log("Goal: Find optimal balance between bar and skin thickness")
+            self.log("="*70)
+
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
+
+            # Calculate bar-skin proximity mapping
+            self.calculate_bar_skin_proximity()
+
+            # Create output folder
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"coupled_efficiency_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== Data structures for analysis ==========
+            efficiency_history = []  # Track efficiency per iteration
+            pareto_front = []  # (weight, rf, bar_avg_t, skin_avg_t, iteration)
+            bar_sensitivity_history = []  # ΔRF_bar / ΔWeight_bar
+            skin_sensitivity_history = []  # ΔRF_skin / ΔWeight_skin
+
+            # ========== PHASE 1: Initialize at MINIMUM thicknesses ==========
+            self.log("\n" + "="*50)
+            self.log("INITIALIZATION: All properties at MINIMUM")
+            self.log("="*50)
+
+            for pid in self.bar_properties:
+                self.current_bar_thicknesses[pid] = bar_min
+            for pid in self.skin_properties:
+                self.current_skin_thicknesses[pid] = skin_min
+
+            self.log(f"  Bars: {len(self.bar_properties)} properties -> {bar_min} mm")
+            self.log(f"  Skins: {len(self.skin_properties)} properties -> {skin_min} mm")
+
+            # Get initial baseline
+            self.log("\n  Running initial baseline analysis...")
+            iter_folder = os.path.join(base_folder, "iter_000_baseline")
+            os.makedirs(iter_folder, exist_ok=True)
+
+            baseline_result = self._run_iteration(iter_folder, 0, target_rf)
+            if not baseline_result:
+                self.log("  ERROR: Baseline analysis failed!")
+                return
+
+            self.iteration_results.append(baseline_result)
+            prev_rf = baseline_result['min_rf']
+            prev_weight = baseline_result['weight']
+
+            pareto_front.append({
+                'iteration': 0,
+                'weight': prev_weight,
+                'rf': prev_rf,
+                'bar_avg_t': bar_min,
+                'skin_avg_t': skin_min,
+                'action': 'baseline'
+            })
+
+            self.log(f"\n  Baseline: RF={prev_rf:.4f}, Weight={prev_weight:.6f}t")
+
+            # ========== PHASE 2: Iterative Efficiency Analysis ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: ITERATIVE EFFICIENCY ANALYSIS")
+            self.log("="*50)
+
+            best_weight = float('inf')
+            converged = False
+
+            # Track cumulative changes
+            cumulative_bar_increase = 0.0
+            cumulative_skin_increase = 0.0
+            cumulative_bar_rf_gain = 0.0
+            cumulative_skin_rf_gain = 0.0
+
+            for iteration in range(1, max_iter + 1):
+                if not self.is_running:
+                    break
+
+                self.log(f"\n{'='*60}")
+                self.log(f"ITERATION {iteration}/{max_iter}")
+                self.log(f"{'='*60}")
+
+                self.update_progress((iteration/max_iter)*100, f"Iter {iteration}/{max_iter}")
+
+                # Get per-property RF from previous result
+                rf_details = baseline_result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                # ========== Identify failing properties ==========
+                failing_bars = []
+                failing_skins = []
+
+                for pid in self.bar_properties:
+                    bar_rf = pid_min_rf.get(pid, target_rf)
+                    if bar_rf < target_rf - rf_tol:
+                        failing_bars.append((pid, bar_rf))
+
+                for pid in self.skin_properties:
+                    skin_rf = pid_min_rf.get(pid, target_rf)
+                    if skin_rf < target_rf - rf_tol:
+                        failing_skins.append((pid, skin_rf))
+
+                # Also consider skins near failing bars (coupled effect)
+                for bar_pid, bar_rf in failing_bars:
+                    if bar_pid in self.bar_to_nearby_skins:
+                        for skin_pid in self.bar_to_nearby_skins[bar_pid]:
+                            if skin_pid not in [s[0] for s in failing_skins]:
+                                skin_rf = pid_min_rf.get(skin_pid, target_rf)
+                                failing_skins.append((skin_pid, skin_rf))
+
+                self.log(f"\n  Status: {len(failing_bars)} failing bars, {len(failing_skins)} failing/coupled skins")
+
+                # ========== Check convergence ==========
+                if len(failing_bars) == 0 and len(failing_skins) == 0:
+                    if prev_rf >= target_rf - rf_tol:
+                        self.log(f"\n  *** CONVERGED! All RF >= {target_rf - rf_tol:.3f} ***")
+                        converged = True
+                        if prev_weight < best_weight:
+                            best_weight = prev_weight
+                            self.best_solution = baseline_result
+                        break
+
+                # ========== Calculate weight sensitivities ==========
+                weight_sens = self._calculate_weight_sensitivities()
+
+                # ========== Estimate efficiency for BAR increase ==========
+                bar_weight_delta = 0.0
+                bar_thickness_increases = {}
+
+                alpha = 0.5  # Stress ratio exponent
+
+                for pid, bar_rf in failing_bars:
+                    old_t = self.current_bar_thicknesses[pid]
+                    if bar_rf > 0:
+                        ratio = (target_rf / bar_rf) ** alpha
+                        ratio = min(ratio, 1.3)  # Max 30% increase
+                        delta_t = old_t * (ratio - 1)
+                        delta_t = max(step * 0.5, min(delta_t, step * 2))  # Bound the change
+                    else:
+                        delta_t = step
+
+                    new_t = min(old_t + delta_t, bar_max)
+                    actual_delta = new_t - old_t
+
+                    bar_thickness_increases[pid] = actual_delta
+                    bar_weight_delta += weight_sens.get(pid, 0) * actual_delta
+
+                # ========== Estimate efficiency for SKIN increase ==========
+                skin_weight_delta = 0.0
+                skin_thickness_increases = {}
+
+                for pid, skin_rf in failing_skins:
+                    old_t = self.current_skin_thicknesses[pid]
+                    if skin_rf > 0 and skin_rf < target_rf:
+                        ratio = (target_rf / skin_rf) ** (alpha * 0.7)  # Smaller exponent for skins
+                        ratio = min(ratio, 1.2)  # Max 20% increase for skins
+                        delta_t = old_t * (ratio - 1)
+                        delta_t = max(step * 0.3, min(delta_t, step * 1.5))
+                    else:
+                        delta_t = step * 0.5
+
+                    new_t = min(old_t + delta_t, skin_max)
+                    actual_delta = new_t - old_t
+
+                    skin_thickness_increases[pid] = actual_delta
+                    skin_weight_delta += weight_sens.get(pid, 0) * actual_delta
+
+                # ========== Decision: Which to prioritize? ==========
+                # Calculate expected efficiency based on previous iterations
+
+                # Use history to estimate RF gain
+                if len(bar_sensitivity_history) > 0:
+                    avg_bar_efficiency = sum(bar_sensitivity_history) / len(bar_sensitivity_history)
+                else:
+                    # Bars typically have better efficiency (less weight per RF gain)
+                    avg_bar_efficiency = 0.1  # Initial estimate
+
+                if len(skin_sensitivity_history) > 0:
+                    avg_skin_efficiency = sum(skin_sensitivity_history) / len(skin_sensitivity_history)
+                else:
+                    avg_skin_efficiency = 0.05  # Initial estimate (skins are heavier)
+
+                expected_bar_rf_gain = avg_bar_efficiency * bar_weight_delta if bar_weight_delta > 0 else 0
+                expected_skin_rf_gain = avg_skin_efficiency * skin_weight_delta if skin_weight_delta > 0 else 0
+
+                # Calculate efficiency ratio
+                if bar_weight_delta > 0 and skin_weight_delta > 0:
+                    bar_efficiency_ratio = expected_bar_rf_gain / bar_weight_delta
+                    skin_efficiency_ratio = expected_skin_rf_gain / skin_weight_delta
+                else:
+                    bar_efficiency_ratio = 0
+                    skin_efficiency_ratio = 0
+
+                self.log(f"\n  Efficiency Analysis:")
+                self.log(f"    Bar increase: ΔWeight={bar_weight_delta*1e6:.2f}g, Expected ΔRF={expected_bar_rf_gain:.4f}")
+                self.log(f"    Skin increase: ΔWeight={skin_weight_delta*1e6:.2f}g, Expected ΔRF={expected_skin_rf_gain:.4f}")
+
+                # ========== Apply updates based on efficiency ==========
+                # Strategy: Apply BOTH but with weighted proportions
+                # More efficient component gets larger updates
+
+                total_efficiency = bar_efficiency_ratio + skin_efficiency_ratio
+                if total_efficiency > 0:
+                    bar_factor = 0.5 + 0.3 * (bar_efficiency_ratio / total_efficiency)  # 0.5-0.8
+                    skin_factor = 0.5 + 0.3 * (skin_efficiency_ratio / total_efficiency)  # 0.5-0.8
+                else:
+                    bar_factor = 0.7  # Default: favor bars
+                    skin_factor = 0.5
+
+                self.log(f"    Update factors: Bar={bar_factor:.2f}, Skin={skin_factor:.2f}")
+
+                # Apply BAR updates
+                bars_updated = 0
+                for pid, delta_t in bar_thickness_increases.items():
+                    old_t = self.current_bar_thicknesses[pid]
+                    new_t = min(old_t + delta_t * bar_factor, bar_max)
+                    if new_t > old_t:
+                        self.current_bar_thicknesses[pid] = new_t
+                        bars_updated += 1
+
+                # Apply SKIN updates
+                skins_updated = 0
+                for pid, delta_t in skin_thickness_increases.items():
+                    old_t = self.current_skin_thicknesses[pid]
+                    new_t = min(old_t + delta_t * skin_factor, skin_max)
+                    if new_t > old_t:
+                        self.current_skin_thicknesses[pid] = new_t
+                        skins_updated += 1
+
+                self.log(f"\n  Applied: {bars_updated} bars updated, {skins_updated} skins updated")
+
+                # ========== Run analysis with new thicknesses ==========
+                iter_folder = os.path.join(base_folder, f"iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+
+                result = self._run_iteration(iter_folder, iteration, target_rf)
+
+                if not result:
+                    self.log("  ERROR: Iteration failed!")
+                    continue
+
+                self.iteration_results.append(result)
+                curr_rf = result['min_rf']
+                curr_weight = result['weight']
+
+                # ========== Calculate actual efficiency ==========
+                delta_rf = curr_rf - prev_rf
+                delta_weight = curr_weight - prev_weight
+
+                # Update sensitivity history
+                if bar_weight_delta > 0 and bars_updated > 0:
+                    # Estimate bar's contribution to RF change
+                    bar_rf_contribution = delta_rf * (bar_weight_delta / (bar_weight_delta + skin_weight_delta + 1e-9))
+                    actual_bar_efficiency = bar_rf_contribution / bar_weight_delta if bar_weight_delta > 0 else 0
+                    bar_sensitivity_history.append(actual_bar_efficiency)
+                    cumulative_bar_increase += bar_weight_delta
+                    cumulative_bar_rf_gain += bar_rf_contribution
+
+                if skin_weight_delta > 0 and skins_updated > 0:
+                    # Estimate skin's contribution to RF change
+                    skin_rf_contribution = delta_rf * (skin_weight_delta / (bar_weight_delta + skin_weight_delta + 1e-9))
+                    actual_skin_efficiency = skin_rf_contribution / skin_weight_delta if skin_weight_delta > 0 else 0
+                    skin_sensitivity_history.append(actual_skin_efficiency)
+                    cumulative_skin_increase += skin_weight_delta
+                    cumulative_skin_rf_gain += skin_rf_contribution
+
+                # Calculate average thicknesses
+                avg_bar_t = sum(self.current_bar_thicknesses.values()) / len(self.current_bar_thicknesses) if self.current_bar_thicknesses else 0
+                avg_skin_t = sum(self.current_skin_thicknesses.values()) / len(self.current_skin_thicknesses) if self.current_skin_thicknesses else 0
+
+                # Add to Pareto front
+                pareto_front.append({
+                    'iteration': iteration,
+                    'weight': curr_weight,
+                    'rf': curr_rf,
+                    'bar_avg_t': avg_bar_t,
+                    'skin_avg_t': avg_skin_t,
+                    'delta_rf': delta_rf,
+                    'delta_weight': delta_weight,
+                    'efficiency': delta_rf / delta_weight if delta_weight > 0 else 0,
+                    'action': f"bar_factor={bar_factor:.2f}, skin_factor={skin_factor:.2f}"
+                })
+
+                efficiency_history.append({
+                    'iteration': iteration,
+                    'bar_efficiency': actual_bar_efficiency if bar_weight_delta > 0 else 0,
+                    'skin_efficiency': actual_skin_efficiency if skin_weight_delta > 0 else 0,
+                    'overall_efficiency': delta_rf / delta_weight if delta_weight > 0 else 0
+                })
+
+                # Log results
+                self.log(f"\n  Results:")
+                self.log(f"    RF: {prev_rf:.4f} -> {curr_rf:.4f} (Δ={delta_rf:+.4f})")
+                self.log(f"    Weight: {prev_weight:.6f}t -> {curr_weight:.6f}t (Δ={delta_weight*1e6:+.2f}g)")
+                self.log(f"    Avg thickness: Bar={avg_bar_t:.2f}mm, Skin={avg_skin_t:.2f}mm")
+
+                if delta_weight > 0:
+                    overall_efficiency = delta_rf / delta_weight
+                    self.log(f"    Overall Efficiency: {overall_efficiency:.4f} RF/tonne")
+
+                # Track best solution
+                if curr_rf >= target_rf - rf_tol and curr_weight < best_weight:
+                    best_weight = curr_weight
+                    self.best_solution = result
+                    self.log(f"  *** NEW BEST: Weight={curr_weight:.6f}t ***")
+
+                # Update for next iteration
+                prev_rf = curr_rf
+                prev_weight = curr_weight
+                baseline_result = result
+
+                # Check if efficiency is dropping (diminishing returns)
+                if len(efficiency_history) >= 3:
+                    recent_eff = [e['overall_efficiency'] for e in efficiency_history[-3:]]
+                    if all(e <= 0.001 for e in recent_eff) and curr_rf >= target_rf - rf_tol:
+                        self.log(f"\n  *** Diminishing returns detected - stopping early ***")
+                        converged = True
+                        break
+
+            # ========== PHASE 3: Analysis and Report ==========
+            self.log("\n" + "="*70)
+            self.log("COUPLED EFFICIENCY ANALYSIS COMPLETE")
+            self.log("="*70)
+
+            # Summary statistics
+            self.log("\n  EFFICIENCY SUMMARY:")
+            self.log("  " + "-" * 50)
+
+            if cumulative_bar_increase > 0:
+                avg_bar_eff = cumulative_bar_rf_gain / cumulative_bar_increase
+                self.log(f"    Bar: Total ΔWeight={cumulative_bar_increase*1e6:.2f}g, Total ΔRF={cumulative_bar_rf_gain:.4f}")
+                self.log(f"          Average Efficiency: {avg_bar_eff:.4f} RF/tonne")
+            else:
+                avg_bar_eff = 0
+                self.log(f"    Bar: No updates applied")
+
+            if cumulative_skin_increase > 0:
+                avg_skin_eff = cumulative_skin_rf_gain / cumulative_skin_increase
+                self.log(f"    Skin: Total ΔWeight={cumulative_skin_increase*1e6:.2f}g, Total ΔRF={cumulative_skin_rf_gain:.4f}")
+                self.log(f"          Average Efficiency: {avg_skin_eff:.4f} RF/tonne")
+            else:
+                avg_skin_eff = 0
+                self.log(f"    Skin: No updates applied")
+
+            # Determine which is more efficient
+            self.log("\n  CONCLUSION:")
+            if avg_bar_eff > avg_skin_eff * 1.2:
+                self.log(f"    >>> BAR increases are {avg_bar_eff/avg_skin_eff:.1f}x more efficient than SKIN <<<")
+                self.log(f"    Recommendation: Prioritize bar thickness for weight-efficient design")
+            elif avg_skin_eff > avg_bar_eff * 1.2:
+                self.log(f"    >>> SKIN increases are {avg_skin_eff/avg_bar_eff:.1f}x more efficient than BAR <<<")
+                self.log(f"    Recommendation: Prioritize skin thickness for weight-efficient design")
+            else:
+                self.log(f"    >>> BAR and SKIN have similar efficiency <<<")
+                self.log(f"    Recommendation: Balance both for optimal design")
+
+            # Save Pareto front to CSV
+            pareto_df = pd.DataFrame(pareto_front)
+            pareto_df.to_csv(os.path.join(base_folder, "pareto_front.csv"), index=False)
+            self.log(f"\n  Pareto front saved to: pareto_front.csv")
+
+            # Save efficiency history
+            eff_df = pd.DataFrame(efficiency_history)
+            eff_df.to_csv(os.path.join(base_folder, "efficiency_history.csv"), index=False)
+            self.log(f"  Efficiency history saved to: efficiency_history.csv")
+
+            # Final results
+            if self.best_solution:
+                self.log(f"\n  BEST SOLUTION:")
+                self.log(f"    Min RF: {self.best_solution['min_rf']:.4f}")
+                self.log(f"    Weight: {self.best_solution['weight']:.6f} tonnes")
+                self.log(f"    Iteration: {self.best_solution['iteration']}")
+                self.log(f"    Converged: {'Yes' if converged else 'No'}")
+
+                # Calculate final average thicknesses
+                final_bar_avg = sum(self.current_bar_thicknesses.values()) / len(self.current_bar_thicknesses) if self.current_bar_thicknesses else 0
+                final_skin_avg = sum(self.current_skin_thicknesses.values()) / len(self.current_skin_thicknesses) if self.current_skin_thicknesses else 0
+                self.log(f"    Final Avg Bar: {final_bar_avg:.2f} mm")
+                self.log(f"    Final Avg Skin: {final_skin_avg:.2f} mm")
+
+                self._generate_final_report(base_folder, "Coupled Efficiency Analysis",
+                    nastran_count=iteration + 1,
+                    extra_info={
+                        "Strategy": "RF vs Weight trade-off analysis",
+                        "Bar Avg Efficiency": f"{avg_bar_eff:.4f} RF/tonne",
+                        "Skin Avg Efficiency": f"{avg_skin_eff:.4f} RF/tonne",
+                        "Final Avg Bar": f"{final_bar_avg:.2f} mm",
+                        "Final Avg Skin": f"{final_skin_avg:.2f} mm",
+                        "Converged": "Yes" if converged else "No"
+                    })
+
+                self.root.after(0, lambda: self.result_summary.config(
+                    text=f"Best: Weight={self.best_solution['weight']:.6f}t, RF={self.best_solution['min_rf']:.4f}",
+                    foreground="green"
+                ))
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Coupled Efficiency Analysis Complete",
+                    f"Optimization Complete!\n\n"
+                    f"Best RF: {self.best_solution['min_rf']:.4f}\n"
+                    f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
+                    f"Iterations: {iteration}\n\n"
+                    f"Bar Efficiency: {avg_bar_eff:.4f} RF/tonne\n"
+                    f"Skin Efficiency: {avg_skin_eff:.4f} RF/tonne\n\n"
+                    f"Results saved to:\n{base_folder}"
                 ))
             else:
                 self.log("ERROR: No feasible solution found!")
