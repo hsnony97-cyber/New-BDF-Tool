@@ -242,7 +242,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Bottom-Up (Min to Target)',)
+        algo_combo['values'] = ('Bottom-Up (Min to Target)', 'Decoupled Min Weight')
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -1097,8 +1097,13 @@ class ThicknessIterationTool:
         self.iteration_results = []
         self.best_solution = None
 
-        # Run Bottom-Up algorithm
-        threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
+        # Run selected algorithm
+        algo = self.algorithm_var.get()
+        if algo == 'Decoupled Min Weight':
+            threading.Thread(target=self._run_decoupled_min_weight, daemon=True).start()
+        else:
+            # Default: Bottom-Up (Min to Target)
+            threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
 
     def stop_optimization(self):
         self.is_running = False
@@ -3676,6 +3681,354 @@ class ThicknessIterationTool:
                     f"Best RF: {self.best_solution['min_rf']:.4f}\n"
                     f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
                     f"Converged: {'Yes' if converged else 'No'}"
+                ))
+            else:
+                self.log("ERROR: No feasible solution found!")
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: [self.btn_start.config(state=tk.NORMAL), self.btn_stop.config(state=tk.DISABLED)])
+
+    def _run_decoupled_min_weight(self):
+        """Algorithm: Decoupled Minimum Weight - Bars first, then only failing skins.
+
+        This algorithm achieves MINIMUM WEIGHT by:
+        1. Phase 1: Optimize ONLY bars (skins stay at minimum) until bars converge
+        2. Phase 2: Run analysis and update ONLY skins that have their OWN RF < target
+        3. NO coupled updates - each property is judged by its OWN RF, not neighbors
+
+        Why this works:
+        - Bars have much lower weight sensitivity (kg/mm) than skins
+        - By optimizing bars first, we maximize structural efficiency
+        - Skins are only increased when THEY actually fail, not when nearby bars fail
+        - Avoids the "early skin thickening" problem of coupled algorithms
+        """
+        try:
+            self.log("\n" + "="*70)
+            self.log("ALGORITHM: DECOUPLED MINIMUM WEIGHT")
+            self.log("="*70)
+            self.log("Strategy: Bars first (cheap), then only failing skins (expensive)")
+            self.log("Key: NO coupled updates - each property judged by its OWN RF")
+            self.log("="*70)
+
+            max_iter = int(self.max_iterations.get())
+            target_rf = float(self.target_rf.get())
+            rf_tol = float(self.rf_tolerance.get())
+            bar_min = float(self.bar_min_thickness.get())
+            bar_max = float(self.bar_max_thickness.get())
+            skin_min = float(self.skin_min_thickness.get())
+            skin_max = float(self.skin_max_thickness.get())
+            step = float(self.thickness_step.get())
+
+            # Create output folder
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_folder = os.path.join(self.output_folder.get(), f"decoupled_minweight_{timestamp}")
+            os.makedirs(base_folder, exist_ok=True)
+
+            # ========== PHASE 1: Initialize at MINIMUM thicknesses ==========
+            self.log("\n" + "="*50)
+            self.log("INITIALIZATION: All properties at MINIMUM")
+            self.log("="*50)
+
+            for pid in self.bar_properties:
+                self.current_bar_thicknesses[pid] = bar_min
+
+            for pid in self.skin_properties:
+                self.current_skin_thicknesses[pid] = skin_min
+
+            self.log(f"  Bars: {len(self.bar_properties)} properties -> {bar_min} mm")
+            self.log(f"  Skins: {len(self.skin_properties)} properties -> {skin_min} mm (LOCKED in Phase 1)")
+
+            # ========== PHASE 1: BAR-ONLY OPTIMIZATION ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 1: BAR-ONLY OPTIMIZATION")
+            self.log("="*50)
+            self.log("Skins are LOCKED at minimum - only bars will be adjusted")
+
+            best_weight = float('inf')
+            bars_converged = False
+            phase1_iterations = 0
+            max_phase1_iter = max(10, max_iter // 2)  # At least 10, or half of max_iter
+
+            for iteration in range(1, max_phase1_iter + 1):
+                if not self.is_running:
+                    break
+
+                phase1_iterations = iteration
+                self.log(f"\n{'='*50}")
+                self.log(f"PHASE 1 - ITERATION {iteration}/{max_phase1_iter}")
+                self.log(f"{'='*50}")
+
+                iter_folder = os.path.join(base_folder, f"phase1_iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+
+                self.update_progress((iteration/max_iter)*50, f"Phase 1: Bars only - Iter {iteration}")
+
+                # Run Nastran
+                result = self._run_iteration(iter_folder, iteration, target_rf)
+
+                if not result:
+                    self.log("  ERROR: Iteration failed!")
+                    continue
+
+                self.iteration_results.append(result)
+                min_rf = result['min_rf']
+                weight = result['weight']
+
+                # Get per-property RF
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                # Count bar convergence (how many bars have RF >= target)
+                bars_ok = 0
+                bars_total = 0
+                bars_failing = []
+                for pid in self.bar_properties:
+                    bar_rf = pid_min_rf.get(pid, None)
+                    if bar_rf is not None:
+                        bars_total += 1
+                        if bar_rf >= target_rf - rf_tol:
+                            bars_ok += 1
+                        else:
+                            bars_failing.append((pid, bar_rf))
+
+                bar_convergence_pct = (bars_ok / bars_total * 100) if bars_total > 0 else 0
+                self.log(f"\n  BAR STATUS: {bars_ok}/{bars_total} converged ({bar_convergence_pct:.1f}%)")
+                self.log(f"  Min RF: {min_rf:.4f}, Weight: {weight:.6f}t")
+
+                # Check if bars are converged (90% or more at target)
+                if bar_convergence_pct >= 90:
+                    self.log(f"\n  *** BARS CONVERGED! {bar_convergence_pct:.1f}% at RF >= {target_rf - rf_tol:.3f} ***")
+                    bars_converged = True
+                    if weight < best_weight:
+                        best_weight = weight
+                        self.best_solution = result
+                    break
+
+                # Update ONLY BAR thicknesses (skins stay locked)
+                self.log(f"\n  Updating BAR thicknesses only...")
+                bars_increased = 0
+                bars_decreased = 0
+
+                alpha = 0.5  # Stress ratio exponent
+
+                for pid in self.bar_properties:
+                    old_t = self.current_bar_thicknesses[pid]
+                    bar_rf = pid_min_rf.get(pid, None)
+
+                    if bar_rf is None:
+                        continue  # No data for this bar
+
+                    if bar_rf < target_rf - rf_tol:
+                        # Under-designed: INCREASE
+                        ratio = (target_rf / bar_rf) ** alpha
+                        ratio = min(ratio, 1.3)  # Max 30% increase
+                        new_t = old_t * ratio
+                        bars_increased += 1
+                    elif bar_rf > target_rf + rf_tol * 2:
+                        # Over-designed: REDUCE (more conservative)
+                        ratio = (target_rf / bar_rf) ** alpha
+                        ratio = max(ratio, 0.85)  # Max 15% reduction
+                        new_t = old_t * ratio
+                        bars_decreased += 1
+                    else:
+                        new_t = old_t  # Within tolerance
+
+                    new_t = max(bar_min, min(bar_max, new_t))
+                    self.current_bar_thicknesses[pid] = new_t
+
+                self.log(f"    Bars: {bars_increased} increased, {bars_decreased} decreased")
+                self.log(f"    Skins: LOCKED at {skin_min} mm (no changes)")
+
+            # ========== PHASE 2: SKIN-ONLY OPTIMIZATION (DECOUPLED) ==========
+            self.log("\n" + "="*50)
+            self.log("PHASE 2: SKIN-ONLY OPTIMIZATION (DECOUPLED)")
+            self.log("="*50)
+            self.log("Bars are now LOCKED - only skins with their OWN RF < target will be increased")
+            self.log("KEY: NO coupled updates - each skin judged by its OWN stress, not neighbor bars")
+
+            phase2_iterations = 0
+            max_phase2_iter = max_iter - phase1_iterations
+            skins_converged = False
+
+            for iteration in range(1, max_phase2_iter + 1):
+                if not self.is_running:
+                    break
+
+                phase2_iterations = iteration
+                total_iter = phase1_iterations + iteration
+
+                self.log(f"\n{'='*50}")
+                self.log(f"PHASE 2 - ITERATION {iteration}/{max_phase2_iter} (Total: {total_iter})")
+                self.log(f"{'='*50}")
+
+                iter_folder = os.path.join(base_folder, f"phase2_iter_{iteration:03d}")
+                os.makedirs(iter_folder, exist_ok=True)
+
+                self.update_progress(50 + (iteration/max_phase2_iter)*50, f"Phase 2: Skins - Iter {iteration}")
+
+                # Run Nastran
+                result = self._run_iteration(iter_folder, total_iter, target_rf)
+
+                if not result:
+                    self.log("  ERROR: Iteration failed!")
+                    continue
+
+                self.iteration_results.append(result)
+                min_rf = result['min_rf']
+                weight = result['weight']
+
+                # Get per-property RF
+                rf_details = result.get('rf_details', [])
+                pid_min_rf = {}
+                for d in rf_details:
+                    pid = d.get('pid')
+                    rf = d.get('rf', 0)
+                    if pid:
+                        if pid not in pid_min_rf or rf < pid_min_rf[pid]:
+                            pid_min_rf[pid] = rf
+
+                # Count skin status - ONLY skins with THEIR OWN RF data
+                skins_ok = 0
+                skins_total_with_data = 0
+                skins_failing = []
+                skins_no_data = 0
+
+                for pid in self.skin_properties:
+                    skin_rf = pid_min_rf.get(pid, None)
+                    if skin_rf is not None:
+                        skins_total_with_data += 1
+                        if skin_rf >= target_rf - rf_tol:
+                            skins_ok += 1
+                        else:
+                            skins_failing.append((pid, skin_rf))
+                    else:
+                        skins_no_data += 1
+
+                if skins_total_with_data > 0:
+                    skin_convergence_pct = (skins_ok / skins_total_with_data * 100)
+                else:
+                    skin_convergence_pct = 100  # No data = assume OK
+
+                self.log(f"\n  SKIN STATUS (DECOUPLED - own RF only):")
+                self.log(f"    With RF data: {skins_total_with_data} ({skins_ok} OK, {len(skins_failing)} failing)")
+                self.log(f"    Without RF data: {skins_no_data} (assumed OK - not increased)")
+                self.log(f"    Convergence: {skin_convergence_pct:.1f}%")
+                self.log(f"  Overall: Min RF={min_rf:.4f}, Weight={weight:.6f}t")
+
+                # Track best solution
+                if min_rf >= target_rf - rf_tol and weight < best_weight:
+                    best_weight = weight
+                    self.best_solution = result
+                    self.log(f"  *** NEW BEST: Weight={weight:.6f}t ***")
+
+                # Check convergence
+                if min_rf >= target_rf - rf_tol:
+                    self.log(f"\n  *** FULLY CONVERGED! All RF >= {target_rf - rf_tol:.3f} ***")
+                    skins_converged = True
+                    break
+
+                # Update ONLY SKIN thicknesses that have their OWN RF failing
+                # KEY DIFFERENCE: We do NOT use nearby bar RF - only skin's own RF
+                self.log(f"\n  Updating SKIN thicknesses (DECOUPLED mode)...")
+                skins_increased = 0
+
+                alpha = 0.5
+
+                for pid in self.skin_properties:
+                    old_t = self.current_skin_thicknesses[pid]
+                    skin_rf = pid_min_rf.get(pid, None)
+
+                    # KEY: If skin has no RF data, DO NOT increase it
+                    # This is the DECOUPLED behavior - no guessing from neighbors
+                    if skin_rf is None:
+                        continue  # Skip - no data means we can't judge this skin
+
+                    if skin_rf < target_rf - rf_tol:
+                        # Skin's OWN RF is failing: INCREASE
+                        ratio = (target_rf / skin_rf) ** alpha
+                        ratio = min(ratio, 1.25)  # Max 25% increase for skins
+                        new_t = old_t * ratio
+                        skins_increased += 1
+                        new_t = max(skin_min, min(skin_max, new_t))
+                        self.current_skin_thicknesses[pid] = new_t
+                    # Note: We don't decrease skins here - keep minimum weight
+
+                self.log(f"    Skins increased: {skins_increased} (only those with their OWN RF < {target_rf - rf_tol:.3f})")
+                self.log(f"    Skins skipped: {skins_no_data} (no RF data - NOT increased)")
+                self.log(f"    Bars: LOCKED (no changes in Phase 2)")
+
+                # If no skins need updating and we still haven't converged,
+                # the problem might be with bars that need more adjustment
+                if skins_increased == 0 and not skins_converged:
+                    self.log(f"\n  Note: No skins updated, but min RF still < target")
+                    self.log(f"  This may indicate bars need further adjustment...")
+
+                    # Allow some bar adjustment in phase 2 if needed
+                    bars_adjusted = 0
+                    for pid in self.bar_properties:
+                        bar_rf = pid_min_rf.get(pid, None)
+                        if bar_rf is not None and bar_rf < target_rf - rf_tol:
+                            old_t = self.current_bar_thicknesses[pid]
+                            ratio = (target_rf / bar_rf) ** 0.4
+                            ratio = min(ratio, 1.15)  # Smaller increase in phase 2
+                            new_t = min(old_t * ratio, bar_max)
+                            self.current_bar_thicknesses[pid] = new_t
+                            bars_adjusted += 1
+
+                    if bars_adjusted > 0:
+                        self.log(f"    Also adjusted {bars_adjusted} bars that were still failing")
+
+            # ========== FINAL RESULTS ==========
+            self.log("\n" + "="*70)
+            self.log("DECOUPLED MINIMUM WEIGHT OPTIMIZATION COMPLETE")
+            self.log("="*70)
+
+            total_iterations = phase1_iterations + phase2_iterations
+
+            if self.best_solution:
+                self.log(f"\nBest Solution:")
+                self.log(f"  Min RF: {self.best_solution['min_rf']:.4f}")
+                self.log(f"  Weight: {self.best_solution['weight']:.6f} tonnes")
+                self.log(f"  Phase 1 (bars): {phase1_iterations} iterations")
+                self.log(f"  Phase 2 (skins): {phase2_iterations} iterations")
+                self.log(f"  Total: {total_iterations} iterations")
+                self.log(f"  Bars converged: {'Yes' if bars_converged else 'No'}")
+                self.log(f"  Skins converged: {'Yes' if skins_converged else 'No'}")
+
+                self._generate_final_report(base_folder, "Decoupled Minimum Weight",
+                    nastran_count=total_iterations,
+                    extra_info={
+                        "Strategy": "Bars first, then only failing skins (no coupled updates)",
+                        "Phase 1 (Bars)": f"{phase1_iterations} iterations",
+                        "Phase 2 (Skins)": f"{phase2_iterations} iterations",
+                        "Key Difference": "Skins updated only by their OWN RF, not neighbors"
+                    })
+
+                self.root.after(0, lambda: self.result_summary.config(
+                    text=f"Best: Weight={self.best_solution['weight']:.6f}t, RF={self.best_solution['min_rf']:.4f}",
+                    foreground="green"
+                ))
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Decoupled Min Weight Complete",
+                    f"Optimization Complete!\n\n"
+                    f"Best RF: {self.best_solution['min_rf']:.4f}\n"
+                    f"Best Weight: {self.best_solution['weight']:.6f} tonnes\n"
+                    f"Phase 1 (bars): {phase1_iterations} iters\n"
+                    f"Phase 2 (skins): {phase2_iterations} iters\n"
+                    f"Total: {total_iterations} iterations"
                 ))
             else:
                 self.log("ERROR: No feasible solution found!")
