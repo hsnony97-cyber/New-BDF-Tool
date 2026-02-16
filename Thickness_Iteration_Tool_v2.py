@@ -64,7 +64,7 @@ class ThicknessIterationTool:
 
         # Optimization settings
         self.max_iterations = tk.StringVar(value="50")
-        self.algorithm_var = tk.StringVar(value="Simple Iterative")
+        self.algorithm_var = tk.StringVar(value="Bottom-Up (Min to Target)")
 
         # GA Parameters
         self.ga_population = tk.StringVar(value="50")
@@ -242,7 +242,7 @@ class ThicknessIterationTool:
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Algorithm:").pack(side=tk.LEFT)
         algo_combo = ttk.Combobox(row, textvariable=self.algorithm_var, width=25, state='readonly')
-        algo_combo['values'] = ('Simple Iterative', 'Fast GA (Surrogate)', 'Full GA + Nastran', 'Surrogate-Assisted GA', 'RSM + SQP', 'Hybrid GA + Nastran', 'Top-Down (Max to Target)', 'Bottom-Up (Min to Target)', 'Weight-Efficient Bottom-Up', 'Balanced Bottom-Up', 'Adaptive Coupled')
+        algo_combo['values'] = ('Bottom-Up (Min to Target)',)
         algo_combo.pack(side=tk.LEFT, padx=5)
         algo_combo.bind('<<ComboboxSelected>>', self._on_algorithm_change)
 
@@ -307,10 +307,7 @@ class ThicknessIterationTool:
 
         self.log("="*70)
         self.log("Thickness Iteration Tool v3.0")
-        self.log("Per-property optimization with 3 algorithms")
-        self.log("  1. Simple Iterative")
-        self.log("  2. Fast GA (Surrogate Model)")
-        self.log("  3. Hybrid GA + Nastran")
+        self.log("Bottom-Up (Min to Target) Optimization")
         self.log("="*70)
 
     def _on_algorithm_change(self, event=None):
@@ -1100,32 +1097,8 @@ class ThicknessIterationTool:
         self.iteration_results = []
         self.best_solution = None
 
-        # Route to selected algorithm
-        algo = self.algorithm_var.get()
-        if algo == "Simple Iterative":
-            threading.Thread(target=self._run_simple_iterative, daemon=True).start()
-        elif algo == "Fast GA (Surrogate)":
-            threading.Thread(target=self._run_fast_ga, daemon=True).start()
-        elif algo == "Full GA + Nastran":
-            threading.Thread(target=self._run_full_ga_nastran, daemon=True).start()
-        elif algo == "Surrogate-Assisted GA":
-            threading.Thread(target=self._run_surrogate_assisted_ga, daemon=True).start()
-        elif algo == "RSM + SQP":
-            threading.Thread(target=self._run_rsm_sqp, daemon=True).start()
-        elif algo == "Hybrid GA + Nastran":
-            threading.Thread(target=self._run_hybrid_ga, daemon=True).start()
-        elif algo == "Top-Down (Max to Target)":
-            threading.Thread(target=self._run_topdown_algorithm, daemon=True).start()
-        elif algo == "Bottom-Up (Min to Target)":
-            threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
-        elif algo == "Weight-Efficient Bottom-Up":
-            threading.Thread(target=self._run_weight_efficient_bottomup, daemon=True).start()
-        elif algo == "Balanced Bottom-Up":
-            threading.Thread(target=self._run_balanced_bottomup, daemon=True).start()
-        elif algo == "Adaptive Coupled":
-            threading.Thread(target=self._run_adaptive_coupled, daemon=True).start()
-        else:
-            threading.Thread(target=self._run_simple_iterative, daemon=True).start()
+        # Run Bottom-Up algorithm
+        threading.Thread(target=self._run_bottomup_algorithm, daemon=True).start()
 
     def stop_optimization(self):
         self.is_running = False
