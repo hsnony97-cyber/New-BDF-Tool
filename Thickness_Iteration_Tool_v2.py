@@ -55,6 +55,11 @@ class ThicknessIterationTool:
         self.skin_max_thickness = tk.StringVar(value="18.0")
         self.thickness_step = tk.StringVar(value="0.5")
         self.bar_skin_search_distance = tk.StringVar(value="150.0")  # mm - for proximity-based optimization
+        self.use_gfem_thickness = tk.BooleanVar(value=False)  # Use GFEM thickness as initial/min
+
+        # Store GFEM thicknesses from Excel (original design values)
+        self.gfem_bar_thicknesses = {}  # PID -> thickness from Excel
+        self.gfem_skin_thicknesses = {}  # PID -> thickness from Excel
 
         # RF settings
         self.target_rf = tk.StringVar(value="1.0")
@@ -215,6 +220,13 @@ class ThicknessIterationTool:
         ttk.Entry(row, textvariable=self.thickness_step, width=8).pack(side=tk.LEFT, padx=5)
         ttk.Label(row, text="Bar-Skin Distance (mm):").pack(side=tk.LEFT, padx=10)
         ttk.Entry(row, textvariable=self.bar_skin_search_distance, width=8).pack(side=tk.LEFT)
+
+        row = ttk.Frame(f2)
+        row.pack(fill=tk.X, pady=3)
+        ttk.Checkbutton(row, text="Use GFEM thickness for initial/minimum",
+                        variable=self.use_gfem_thickness).pack(side=tk.LEFT)
+        ttk.Label(row, text="(Each property uses its Excel thickness as start & min)",
+                  foreground="gray").pack(side=tk.LEFT, padx=10)
 
         # Section 3: RF Settings
         f3 = ttk.LabelFrame(main, text="3. RF Settings", padding=10)
@@ -590,6 +602,8 @@ class ThicknessIterationTool:
             self.skin_properties = {}
             self.current_bar_thicknesses = {}
             self.current_skin_thicknesses = {}
+            self.gfem_bar_thicknesses = {}
+            self.gfem_skin_thicknesses = {}
 
             for sheet in xl.sheet_names:
                 sl = sheet.lower().replace('_', '').replace(' ', '')
@@ -600,10 +614,12 @@ class ThicknessIterationTool:
                     for _, row in df.iterrows():
                         pid = int(row.iloc[0]) if pd.notna(row.iloc[0]) else None
                         if pid:
+                            gfem_dim1 = float(row.iloc[1]) if len(row) > 1 and pd.notna(row.iloc[1]) else bar_min
                             self.bar_properties[pid] = {
-                                'dim1': float(row.iloc[1]) if len(row) > 1 and pd.notna(row.iloc[1]) else bar_min,
+                                'dim1': gfem_dim1,
                                 'dim2': float(row.iloc[2]) if len(row) > 2 and pd.notna(row.iloc[2]) else bar_min,
                             }
+                            self.gfem_bar_thicknesses[pid] = gfem_dim1  # Store GFEM thickness
                             self.current_bar_thicknesses[pid] = bar_min
                     self.log(f"  Loaded {len(self.bar_properties)} bar properties")
 
@@ -612,9 +628,11 @@ class ThicknessIterationTool:
                     for _, row in df.iterrows():
                         pid = int(row.iloc[0]) if pd.notna(row.iloc[0]) else None
                         if pid:
+                            gfem_thickness = float(row.iloc[1]) if len(row) > 1 and pd.notna(row.iloc[1]) else skin_min
                             self.skin_properties[pid] = {
-                                'thickness': float(row.iloc[1]) if len(row) > 1 and pd.notna(row.iloc[1]) else skin_min,
+                                'thickness': gfem_thickness,
                             }
+                            self.gfem_skin_thicknesses[pid] = gfem_thickness  # Store GFEM thickness
                             self.current_skin_thicknesses[pid] = skin_min
                     self.log(f"  Loaded {len(self.skin_properties)} skin properties")
 
@@ -2846,6 +2864,7 @@ class ThicknessIterationTool:
             skin_min = float(self.skin_min_thickness.get())
             skin_max = float(self.skin_max_thickness.get())
             step = float(self.thickness_step.get())
+            use_gfem = self.use_gfem_thickness.get()
 
             # Calculate bar-skin proximity mapping
             self.calculate_bar_skin_proximity()
@@ -2857,15 +2876,22 @@ class ThicknessIterationTool:
 
             # ========== PHASE 1: Initialize thicknesses ==========
             self.log("\n" + "="*50)
-            self.log("PHASE 1: Initialize thicknesses at MINIMUM")
+            if use_gfem:
+                self.log("PHASE 1: Initialize thicknesses at GFEM values")
+                self.log("(Using Excel thickness as initial and minimum)")
+            else:
+                self.log("PHASE 1: Initialize thicknesses at MINIMUM")
             self.log("="*50)
 
-            # Bar properties: ALL start at MINIMUM
+            # Bar properties: Initialize based on mode
             for pid in self.bar_properties:
-                self.current_bar_thicknesses[pid] = bar_min
+                if use_gfem and pid in self.gfem_bar_thicknesses:
+                    self.current_bar_thicknesses[pid] = self.gfem_bar_thicknesses[pid]
+                else:
+                    self.current_bar_thicknesses[pid] = bar_min
 
-            # Skin properties: Related (near bars) → MIN, Unrelated → MIN
-            # Both start at MIN, but related skins will be optimized with bars
+            # Skin properties: Related (near bars) → initial, Unrelated → initial
+            # Both start at initial value, but related skins will be optimized with bars
             related_skins = set()
             for bar_pid, nearby_skins in self.bar_to_nearby_skins.items():
                 related_skins.update(nearby_skins)
@@ -2873,17 +2899,29 @@ class ThicknessIterationTool:
             related_count = 0
             unrelated_count = 0
             for pid in self.skin_properties:
+                if use_gfem and pid in self.gfem_skin_thicknesses:
+                    init_val = self.gfem_skin_thicknesses[pid]
+                else:
+                    init_val = skin_min
                 if pid in related_skins:
-                    self.current_skin_thicknesses[pid] = skin_min
+                    self.current_skin_thicknesses[pid] = init_val
                     related_count += 1
                 else:
-                    self.current_skin_thicknesses[pid] = skin_min
+                    self.current_skin_thicknesses[pid] = init_val
                     unrelated_count += 1
 
-            self.log(f"  Bar thicknesses: {len(self.bar_properties)} properties → MIN ({bar_min})")
-            self.log(f"  Skin thicknesses:")
-            self.log(f"    Related (near bars): {related_count} properties → MIN ({skin_min})")
-            self.log(f"    Unrelated (far): {unrelated_count} properties → MIN ({skin_min})")
+            if use_gfem:
+                avg_bar = sum(self.gfem_bar_thicknesses.values()) / len(self.gfem_bar_thicknesses) if self.gfem_bar_thicknesses else 0
+                avg_skin = sum(self.gfem_skin_thicknesses.values()) / len(self.gfem_skin_thicknesses) if self.gfem_skin_thicknesses else 0
+                self.log(f"  Bar thicknesses: {len(self.bar_properties)} properties → GFEM (avg: {avg_bar:.2f})")
+                self.log(f"  Skin thicknesses:")
+                self.log(f"    Related (near bars): {related_count} properties → GFEM (avg: {avg_skin:.2f})")
+                self.log(f"    Unrelated (far): {unrelated_count} properties → GFEM")
+            else:
+                self.log(f"  Bar thicknesses: {len(self.bar_properties)} properties → MIN ({bar_min})")
+                self.log(f"  Skin thicknesses:")
+                self.log(f"    Related (near bars): {related_count} properties → MIN ({skin_min})")
+                self.log(f"    Unrelated (far): {unrelated_count} properties → MIN ({skin_min})")
 
             # ========== PHASE 2: Iterative Strengthening ==========
             self.log("\n" + "="*50)
@@ -3006,7 +3044,12 @@ class ThicknessIterationTool:
                         new_t = old_t
                         unchanged_count += 1
 
-                    new_t = max(bar_min, min(bar_max, new_t))
+                    # Use GFEM thickness as minimum if enabled
+                    if use_gfem and pid in self.gfem_bar_thicknesses:
+                        pid_min = self.gfem_bar_thicknesses[pid]
+                    else:
+                        pid_min = bar_min
+                    new_t = max(pid_min, min(bar_max, new_t))
                     self.current_bar_thicknesses[pid] = new_t
 
                 # Update SKIN thicknesses - PROXIMITY-BASED (coupled optimization)
@@ -3050,7 +3093,12 @@ class ThicknessIterationTool:
                         new_t = old_t
                         skin_unchanged += 1
 
-                    new_t = max(skin_min, min(skin_max, new_t))
+                    # Use GFEM thickness as minimum if enabled
+                    if use_gfem and skin_pid in self.gfem_skin_thicknesses:
+                        spid_min = self.gfem_skin_thicknesses[skin_pid]
+                    else:
+                        spid_min = skin_min
+                    new_t = max(spid_min, min(skin_max, new_t))
                     self.current_skin_thicknesses[skin_pid] = new_t
 
                 self.log(f"    Bar properties: {increased_count} increased, {decreased_count} decreased, {unchanged_count} unchanged")
@@ -3726,25 +3774,42 @@ class ThicknessIterationTool:
             skin_min = float(self.skin_min_thickness.get())
             skin_max = float(self.skin_max_thickness.get())
             step = float(self.thickness_step.get())
+            use_gfem = self.use_gfem_thickness.get()
 
             # Create output folder
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_folder = os.path.join(self.output_folder.get(), f"decoupled_minweight_{timestamp}")
             os.makedirs(base_folder, exist_ok=True)
 
-            # ========== PHASE 1: Initialize at MINIMUM thicknesses ==========
+            # ========== PHASE 1: Initialize at MINIMUM/GFEM thicknesses ==========
             self.log("\n" + "="*50)
-            self.log("INITIALIZATION: All properties at MINIMUM")
+            if use_gfem:
+                self.log("INITIALIZATION: All properties at GFEM values")
+                self.log("(Using Excel thickness as initial and minimum)")
+            else:
+                self.log("INITIALIZATION: All properties at MINIMUM")
             self.log("="*50)
 
             for pid in self.bar_properties:
-                self.current_bar_thicknesses[pid] = bar_min
+                if use_gfem and pid in self.gfem_bar_thicknesses:
+                    self.current_bar_thicknesses[pid] = self.gfem_bar_thicknesses[pid]
+                else:
+                    self.current_bar_thicknesses[pid] = bar_min
 
             for pid in self.skin_properties:
-                self.current_skin_thicknesses[pid] = skin_min
+                if use_gfem and pid in self.gfem_skin_thicknesses:
+                    self.current_skin_thicknesses[pid] = self.gfem_skin_thicknesses[pid]
+                else:
+                    self.current_skin_thicknesses[pid] = skin_min
 
-            self.log(f"  Bars: {len(self.bar_properties)} properties -> {bar_min} mm")
-            self.log(f"  Skins: {len(self.skin_properties)} properties -> {skin_min} mm (LOCKED in Phase 1)")
+            if use_gfem:
+                avg_bar = sum(self.gfem_bar_thicknesses.values()) / len(self.gfem_bar_thicknesses) if self.gfem_bar_thicknesses else 0
+                avg_skin = sum(self.gfem_skin_thicknesses.values()) / len(self.gfem_skin_thicknesses) if self.gfem_skin_thicknesses else 0
+                self.log(f"  Bars: {len(self.bar_properties)} properties -> GFEM (avg: {avg_bar:.2f} mm)")
+                self.log(f"  Skins: {len(self.skin_properties)} properties -> GFEM (avg: {avg_skin:.2f} mm, LOCKED in Phase 1)")
+            else:
+                self.log(f"  Bars: {len(self.bar_properties)} properties -> {bar_min} mm")
+                self.log(f"  Skins: {len(self.skin_properties)} properties -> {skin_min} mm (LOCKED in Phase 1)")
 
             # ========== PHASE 1: BAR-ONLY OPTIMIZATION ==========
             self.log("\n" + "="*50)
@@ -3847,11 +3912,19 @@ class ThicknessIterationTool:
                     else:
                         new_t = old_t  # Within tolerance
 
-                    new_t = max(bar_min, min(bar_max, new_t))
+                    # Use GFEM thickness as minimum if enabled
+                    if use_gfem and pid in self.gfem_bar_thicknesses:
+                        pid_min = self.gfem_bar_thicknesses[pid]
+                    else:
+                        pid_min = bar_min
+                    new_t = max(pid_min, min(bar_max, new_t))
                     self.current_bar_thicknesses[pid] = new_t
 
                 self.log(f"    Bars: {bars_increased} increased, {bars_decreased} decreased")
-                self.log(f"    Skins: LOCKED at {skin_min} mm (no changes)")
+                if use_gfem:
+                    self.log(f"    Skins: LOCKED at GFEM values (no changes)")
+                else:
+                    self.log(f"    Skins: LOCKED at {skin_min} mm (no changes)")
 
             # ========== PHASE 2: SKIN-ONLY OPTIMIZATION (DECOUPLED) ==========
             self.log("\n" + "="*50)
@@ -3963,7 +4036,12 @@ class ThicknessIterationTool:
                         ratio = min(ratio, 1.25)  # Max 25% increase for skins
                         new_t = old_t * ratio
                         skins_increased += 1
-                        new_t = max(skin_min, min(skin_max, new_t))
+                        # Use GFEM thickness as minimum if enabled
+                        if use_gfem and pid in self.gfem_skin_thicknesses:
+                            spid_min = self.gfem_skin_thicknesses[pid]
+                        else:
+                            spid_min = skin_min
+                        new_t = max(spid_min, min(skin_max, new_t))
                         self.current_skin_thicknesses[pid] = new_t
                     # Note: We don't decrease skins here - keep minimum weight
 
@@ -3985,7 +4063,12 @@ class ThicknessIterationTool:
                             old_t = self.current_bar_thicknesses[pid]
                             ratio = (target_rf / bar_rf) ** 0.4
                             ratio = min(ratio, 1.15)  # Smaller increase in phase 2
-                            new_t = min(old_t * ratio, bar_max)
+                            # Use GFEM thickness as minimum if enabled
+                            if use_gfem and pid in self.gfem_bar_thicknesses:
+                                pid_min = self.gfem_bar_thicknesses[pid]
+                            else:
+                                pid_min = bar_min
+                            new_t = max(pid_min, min(old_t * ratio, bar_max))
                             self.current_bar_thicknesses[pid] = new_t
                             bars_adjusted += 1
 
@@ -4081,6 +4164,7 @@ class ThicknessIterationTool:
             skin_min = float(self.skin_min_thickness.get())
             skin_max = float(self.skin_max_thickness.get())
             step = float(self.thickness_step.get())
+            use_gfem = self.use_gfem_thickness.get()
 
             # Calculate bar-skin proximity mapping
             self.calculate_bar_skin_proximity()
@@ -4096,18 +4180,34 @@ class ThicknessIterationTool:
             bar_sensitivity_history = []  # ΔRF_bar / ΔWeight_bar
             skin_sensitivity_history = []  # ΔRF_skin / ΔWeight_skin
 
-            # ========== PHASE 1: Initialize at MINIMUM thicknesses ==========
+            # ========== PHASE 1: Initialize at MINIMUM/GFEM thicknesses ==========
             self.log("\n" + "="*50)
-            self.log("INITIALIZATION: All properties at MINIMUM")
+            if use_gfem:
+                self.log("INITIALIZATION: All properties at GFEM values")
+                self.log("(Using Excel thickness as initial and minimum)")
+            else:
+                self.log("INITIALIZATION: All properties at MINIMUM")
             self.log("="*50)
 
             for pid in self.bar_properties:
-                self.current_bar_thicknesses[pid] = bar_min
+                if use_gfem and pid in self.gfem_bar_thicknesses:
+                    self.current_bar_thicknesses[pid] = self.gfem_bar_thicknesses[pid]
+                else:
+                    self.current_bar_thicknesses[pid] = bar_min
             for pid in self.skin_properties:
-                self.current_skin_thicknesses[pid] = skin_min
+                if use_gfem and pid in self.gfem_skin_thicknesses:
+                    self.current_skin_thicknesses[pid] = self.gfem_skin_thicknesses[pid]
+                else:
+                    self.current_skin_thicknesses[pid] = skin_min
 
-            self.log(f"  Bars: {len(self.bar_properties)} properties -> {bar_min} mm")
-            self.log(f"  Skins: {len(self.skin_properties)} properties -> {skin_min} mm")
+            if use_gfem:
+                avg_bar = sum(self.gfem_bar_thicknesses.values()) / len(self.gfem_bar_thicknesses) if self.gfem_bar_thicknesses else 0
+                avg_skin = sum(self.gfem_skin_thicknesses.values()) / len(self.gfem_skin_thicknesses) if self.gfem_skin_thicknesses else 0
+                self.log(f"  Bars: {len(self.bar_properties)} properties -> GFEM (avg: {avg_bar:.2f} mm)")
+                self.log(f"  Skins: {len(self.skin_properties)} properties -> GFEM (avg: {avg_skin:.2f} mm)")
+            else:
+                self.log(f"  Bars: {len(self.bar_properties)} properties -> {bar_min} mm")
+                self.log(f"  Skins: {len(self.skin_properties)} properties -> {skin_min} mm")
 
             # Get initial baseline
             self.log("\n  Running initial baseline analysis...")
@@ -4295,7 +4395,12 @@ class ThicknessIterationTool:
                 bars_updated = 0
                 for pid, delta_t in bar_thickness_increases.items():
                     old_t = self.current_bar_thicknesses[pid]
-                    new_t = min(old_t + delta_t * bar_factor, bar_max)
+                    # Use GFEM thickness as minimum if enabled
+                    if use_gfem and pid in self.gfem_bar_thicknesses:
+                        pid_min = self.gfem_bar_thicknesses[pid]
+                    else:
+                        pid_min = bar_min
+                    new_t = max(pid_min, min(old_t + delta_t * bar_factor, bar_max))
                     if new_t > old_t:
                         self.current_bar_thicknesses[pid] = new_t
                         bars_updated += 1
@@ -4304,7 +4409,12 @@ class ThicknessIterationTool:
                 skins_updated = 0
                 for pid, delta_t in skin_thickness_increases.items():
                     old_t = self.current_skin_thicknesses[pid]
-                    new_t = min(old_t + delta_t * skin_factor, skin_max)
+                    # Use GFEM thickness as minimum if enabled
+                    if use_gfem and pid in self.gfem_skin_thicknesses:
+                        spid_min = self.gfem_skin_thicknesses[pid]
+                    else:
+                        spid_min = skin_min
+                    new_t = max(spid_min, min(old_t + delta_t * skin_factor, skin_max))
                     if new_t > old_t:
                         self.current_skin_thicknesses[pid] = new_t
                         skins_updated += 1
